@@ -1,138 +1,305 @@
-import express from 'express';
-import http from 'http';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import crypto from 'crypto';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import cookieParser from 'cookie-parser';
-import multer from 'multer';
-import pg from 'pg';
-import { WebSocketServer } from 'ws';
+const http = require('http');
+const express = require('express');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const { Pool } = require('pg');
+const { WebSocketServer } = require('ws');
 
-const { Pool } = pg;
-const __filename = fileURLToPath(import.meta.url);
-const ROOT = path.dirname(__filename);
-const PORT = Number(process.env.PORT || 10000);
-const JWT_SECRET = process.env.JWT_SECRET || 'poolvault-development-secret';
-const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
-const USE_PG = Boolean(DATABASE_URL);
-const pool = USE_PG ? new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 10,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000
-}) : null;
 const app = express();
 const server = http.createServer(app);
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 3 * 1024 * 1024 } });
-const memory = { users:new Map(), accounts:new Map(), memberships:new Map(), records:new Map(), proofs:new Map() };
-const clients = new Map();
-let dbMode = USE_PG ? 'postgres' : 'memory';
-let schemaPromise = null;
+const PORT = Number(process.env.PORT || 10000);
+const SESSION_SECRET = process.env.SESSION_SECRET || 'poolvault-local-development-secret';
+const isProd = process.env.NODE_ENV === 'production';
 
-app.disable('x-powered-by');
-app.use(express.json({limit:'200kb'}));
-app.use(cookieParser());
+app.use(express.json({limit:'1mb'}));
+app.use(express.urlencoded({extended:true, limit:'1mb'}));
 
-// Frontend files intentionally live at the project root (no public/ folder).
-for (const file of ['index.html','styles.css','app.js','manifest.webmanifest','service-worker.js']) {
-  app.get('/'+file, (req,res)=>res.sendFile(path.join(ROOT,file)));
-}
-app.get('/', (req,res)=>res.sendFile(path.join(ROOT,'index.html')));
-
-const uid=()=>crypto.randomUUID();
-const cleanName=s=>String(s??'').trim().replace(/\s+/g,' ');
-const shortName=n=>cleanName(n).split(' ')[0] || 'usuário';
-const initial=n=>(shortName(n)[0]||'P').toUpperCase();
-const code=()=>crypto.randomBytes(4).toString('hex').toUpperCase();
-const err=(res,status,message,details='')=>res.status(status).json({ok:false,error:message,details});
-function token(user){return jwt.sign({sub:user.id},JWT_SECRET,{expiresIn:'30d'});}
-function setAuth(res,user){res.cookie('pv_auth',token(user),{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',maxAge:30*86400000,path:'/'});}
-function auth(req,res,next){try{const t=req.cookies.pv_auth;if(!t)return err(res,401,'Não autenticado.');req.userId=jwt.verify(t,JWT_SECRET).sub;next();}catch{return err(res,401,'Sessão expirada.');}}
-
-async function createSchema(){
-  if(!pool) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users(id uuid PRIMARY KEY,name text NOT NULL,phone_digits varchar(4) NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-    CREATE TABLE IF NOT EXISTS accounts(id uuid PRIMARY KEY,name text NOT NULL,invite_code varchar(12) NOT NULL UNIQUE,created_at timestamptz NOT NULL DEFAULT now());
-    CREATE TABLE IF NOT EXISTS memberships(id uuid PRIMARY KEY,user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,created_at timestamptz NOT NULL DEFAULT now(),UNIQUE(user_id,account_id));
-    CREATE TABLE IF NOT EXISTS records(id uuid PRIMARY KEY,account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,type varchar(3) NOT NULL CHECK(type IN ('dep','wit')),amount numeric(14,2) NOT NULL CHECK(amount>0),bank text NOT NULL,description text,proof_name text,proof_mime text,proof_data bytea,created_at timestamptz NOT NULL DEFAULT now());
-    CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships(user_id);
-    CREATE INDEX IF NOT EXISTS records_account_created_idx ON records(account_id,created_at DESC);
-  `);
-  // Existing databases may have an old uniqueness constraint on phone_digits.
-  await pool.query(`DO $$ DECLARE c record; BEGIN FOR c IN SELECT conname FROM pg_constraint WHERE conrelid='users'::regclass AND contype='u' AND pg_get_constraintdef(oid) ILIKE '%phone_digits%' LOOP EXECUTE format('ALTER TABLE users DROP CONSTRAINT %I',c.conname); END LOOP; END $$;`);
-}
-async function db(){
-  if(!pool)return false;
-  if(!schemaPromise) schemaPromise=createSchema().catch(e=>{schemaPromise=null;throw e});
-  await schemaPromise; return true;
-}
-
-async function findUser(id){if(await db()){const r=await pool.query('SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE id=$1',[id]);return r.rows[0]||null;}return memory.users.get(id)||null;}
-async function findByDigits(d){if(await db()){const r=await pool.query('SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE phone_digits=$1 ORDER BY created_at DESC LIMIT 1',[d]);return r.rows[0]||null;}return [...memory.users.values()].find(x=>x.phoneDigits===d)||null;}
-async function accountFor(userId){if(await db()){const r=await pool.query('SELECT a.id,a.name,a.invite_code AS "inviteCode",a.created_at AS "createdAt" FROM accounts a JOIN memberships m ON m.account_id=a.id WHERE m.user_id=$1 ORDER BY m.created_at LIMIT 1',[userId]);return r.rows[0]||null;}const m=[...memory.memberships.values()].find(x=>x.userId===userId);return m?memory.accounts.get(m.accountId):null;}
-async function members(accountId){if(await db()){const r=await pool.query('SELECT u.id,u.name,u.created_at AS "createdAt" FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.account_id=$1 ORDER BY m.created_at',[accountId]);return r.rows.map(x=>({...x,userId:x.id,short:shortName(x.name),initial:initial(x.name)}));}return [...memory.memberships.values()].filter(m=>m.accountId===accountId).map(m=>{const u=memory.users.get(m.userId);return {...u,userId:u.id,short:shortName(u.name),initial:initial(u.name)}});}
-async function records(accountId){if(await db()){const r=await pool.query('SELECT id,user_id AS "userId",type,amount::float AS amount,bank,description,proof_name AS "proofName",created_at AS "createdAt" FROM records WHERE account_id=$1 ORDER BY created_at DESC',[accountId]);return r.rows;}return [...memory.records.values()].filter(x=>x.accountId===accountId).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).map(({accountId,...r})=>r);}
-function broadcast(accountId,msg){const set=clients.get(accountId);if(!set)return;const text=JSON.stringify(msg);for(const ws of set){if(ws.readyState===1)ws.send(text)}}
-
-app.get('/api/health',async(req,res)=>{if(!USE_PG)return res.json({ok:true,db:'memory',persistent:false});try{await db();res.json({ok:true,db:'postgres',persistent:true});}catch(e){res.status(503).json({ok:false,db:'postgres',persistent:true,error:e.message});}});
-app.get('/api/session',async(req,res)=>{try{const t=req.cookies.pv_auth;if(!t)return res.json({ok:true,authenticated:false});const p=jwt.verify(t,JWT_SECRET);const user=await findUser(p.sub);if(!user)return res.json({ok:true,authenticated:false});const account=await accountFor(user.id);if(!account)return res.json({ok:true,authenticated:false});res.json({ok:true,authenticated:true,user,account});}catch(e){console.error('SESSION',e.message);res.json({ok:true,authenticated:false});}});
-
-app.post('/api/auth/signup',async(req,res)=>{
-  const name=cleanName(req.body?.name); const digits=String(req.body?.phoneDigits??'').replace(/\D/g,'');
-  if(name.split(/\s+/).filter(Boolean).length<2)return err(res,400,'Informe nome e sobrenome.');
-  if(!/^\d{4}$/.test(digits))return err(res,400,'Digite os 4 últimos dígitos.');
-  const id=uid(); const createdAt=new Date().toISOString();
-  try{
-    if(await db()){
-      const client=await pool.connect();
-      try{
-        await client.query('BEGIN');
-        const ur=await client.query('INSERT INTO users(id,name,phone_digits,created_at) VALUES($1,$2,$3,$4) RETURNING id,name,phone_digits AS "phoneDigits",created_at AS "createdAt"',[id,name,digits,createdAt]);
-        const user=ur.rows[0]; let account=null;
-        for(let n=0;n<10 && !account;n++){
-          try{const ar=await client.query('INSERT INTO accounts(id,name,invite_code) VALUES($1,$2,$3) RETURNING id,name,invite_code AS "inviteCode",created_at AS "createdAt"',[uid(),`Conta de ${shortName(name)}`,code()]);account=ar.rows[0];}
-          catch(e){if(e.code!=='23505')throw e;}
-        }
-        if(!account)throw new Error('Falha ao gerar a conta conjunta.');
-        await client.query('INSERT INTO memberships(id,user_id,account_id) VALUES($1,$2,$3)',[uid(),user.id,account.id]);
-        await client.query('COMMIT'); setAuth(res,user);
-        return res.status(201).json({ok:true,user,profile:user,account});
-      }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
-    }
-    // Development fallback only: never used when DATABASE_URL is configured.
-    const user={id,name,phoneDigits:digits,createdAt,short:shortName(name),initial:initial(name)};
-    const account={id:uid(),name:`Conta de ${shortName(name)}`,inviteCode:code(),createdAt};
-    memory.users.set(id,user);memory.accounts.set(account.id,account);memory.memberships.set(uid(),{userId:id,accountId:account.id});setAuth(res,user);
-    return res.status(201).json({ok:true,user,profile:user,account});
-  }catch(e){
-    console.error('SIGNUP ERROR:',e);
-    if(e?.code==='23505')return err(res,409,'Esse perfil já está cadastrado. Use a opção de entrar.');
-    return err(res,500,'Não foi possível criar o perfil no servidor.',process.env.NODE_ENV==='production'?'':e.message);
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /^(image\/(jpeg|png|webp|gif)|application\/pdf)$/.test(file.mimetype);
+    cb(ok ? null : new Error('Comprovante deve ser imagem ou PDF.'), ok);
   }
 });
 
-app.post('/api/auth/login',async(req,res)=>{try{const digits=String(req.body?.phoneDigits??'').replace(/\D/g,'');if(!/^\d{4}$/.test(digits))return err(res,400,'Digite os 4 últimos dígitos.');const user=await findByDigits(digits);if(!user)return err(res,404,'Perfil não encontrado.');const account=await accountFor(user.id);if(!account)return err(res,409,'Perfil sem conta conjunta.');setAuth(res,user);res.json({ok:true,user,profile:user,account});}catch(e){console.error('LOGIN ERROR:',e);err(res,500,'Falha no login.',process.env.NODE_ENV==='production'?'':e.message);}});
-app.post('/api/auth/logout',(req,res)=>{res.clearCookie('pv_auth',{path:'/'});res.json({ok:true});});
+// ---------------------------------------------------------------------------
+// Data layer: PostgreSQL in Render, in-memory fallback for local smoke tests.
+// ---------------------------------------------------------------------------
+let pool = null;
+const mem = { users: [], accounts: [], memberships: [], records: [], sessions: [] };
+let seq = { users: 1, accounts: 1, memberships: 1, records: 1 };
 
-app.get('/api/bootstrap',auth,async(req,res)=>{try{const account=await accountFor(req.userId);if(!account)return err(res,404,'Conta conjunta não encontrada.');const user=await findUser(req.userId);res.json({ok:true,user,account,members:await members(account.id),records:await records(account.id)});}catch(e){console.error('BOOTSTRAP',e);err(res,500,'Não foi possível carregar a conta.');}});
-app.get('/api/account',auth,async(req,res)=>{try{const account=await accountFor(req.userId);if(!account)return err(res,404,'Conta não encontrada.');res.json({ok:true,account,members:await members(account.id)});}catch(e){err(res,500,'Não foi possível carregar os membros.');}});
-app.post('/api/account/join',auth,async(req,res)=>{try{const invite=String(req.body?.code||'').trim().toUpperCase();if(!invite)return err(res,400,'Digite o código da conta.');const account=await (async()=>{if(await db()){const r=await pool.query('SELECT id,name,invite_code AS "inviteCode",created_at AS "createdAt" FROM accounts WHERE invite_code=$1',[invite]);return r.rows[0]||null;}return [...memory.accounts.values()].find(a=>a.inviteCode===invite)||null;})();if(!account)return err(res,404,'Código da conta não encontrado.');if(await db())await pool.query('INSERT INTO memberships(id,user_id,account_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[uid(),req.userId,account.id]);else memory.memberships.set(uid(),{userId:req.userId,accountId:account.id});const ms=await members(account.id),rs=await records(account.id);broadcast(account.id,{type:'members',members:ms});res.json({ok:true,account,members:ms,records:rs});}catch(e){console.error('JOIN',e);err(res,500,'Não foi possível entrar na conta.');}});
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: isProd ? { rejectUnauthorized: false } : undefined,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 8000
+  });
+  pool.on('error', err => console.error('[postgres]', err.message));
+}
 
-app.post('/api/records',auth,upload.single('proof'),async(req,res)=>{try{const account=await accountFor(req.userId);if(!account)return err(res,404,'Conta não encontrada.');const type=req.body?.type,amount=Number(req.body?.amount),bank=String(req.body?.bank||'').trim(),description=String(req.body?.description||'').trim();if(!['dep','wit'].includes(type))return err(res,400,'Tipo de movimentação inválido.');if(!(amount>0))return err(res,400,'Valor inválido.');if(!bank)return err(res,400,'Banco/origem é obrigatório.');const id=uid(),createdAt=new Date().toISOString(),f=req.file;if(await db()){await pool.query('INSERT INTO records(id,account_id,user_id,type,amount,bank,description,proof_name,proof_mime,proof_data,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',[id,account.id,req.userId,type,amount.toFixed(2),bank,description,f?.originalname||null,f?.mimetype||null,f?.buffer||null,createdAt]);}else{memory.records.set(id,{id,accountId:account.id,userId:req.userId,type,amount:Number(amount.toFixed(2)),bank,description,proofName:f?.originalname||'',createdAt});if(f)memory.proofs.set(id,{mime:f.mimetype,data:f.buffer,name:f.originalname});}const rs=await records(account.id),record=rs.find(x=>x.id===id);broadcast(account.id,{type:'records',records:rs});res.json({ok:true,record});}catch(e){console.error('RECORD',e);err(res,500,'Não foi possível salvar a movimentação.');}});
-app.get('/api/records/:id/proof',auth,async(req,res)=>{try{const account=await accountFor(req.userId);if(!account)return res.sendStatus(404);if(await db()){const r=await pool.query('SELECT proof_name,proof_mime,proof_data FROM records WHERE id=$1 AND account_id=$2',[req.params.id,account.id]);if(!r.rowCount||!r.rows[0].proof_data)return res.sendStatus(404);res.setHeader('Content-Type',r.rows[0].proof_mime||'application/octet-stream');res.end(r.rows[0].proof_data);return;}const f=memory.proofs.get(req.params.id);if(!f)return res.sendStatus(404);res.setHeader('Content-Type',f.mime);res.end(f.data);}catch{res.sendStatus(500);}});
+async function dbQuery(text, params=[]) {
+  if (!pool) throw new Error('DATABASE_NOT_CONFIGURED');
+  return pool.query(text, params);
+}
 
-const wss=new WebSocketServer({noServer:true});
-server.on('upgrade',(req,socket,head)=>{if(req.url!=='/ws'){socket.destroy();return;}wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws,req));});
-wss.on('connection',async(ws,req)=>{try{const raw=req.headers.cookie||'';const cookies={};for(const part of raw.split(';')){const i=part.indexOf('=');if(i>0)cookies[part.slice(0,i).trim()]=decodeURIComponent(part.slice(i+1));}const p=jwt.verify(cookies.pv_auth,JWT_SECRET);const account=await accountFor(p.sub);if(!account)return ws.close();if(!clients.has(account.id))clients.set(account.id,new Set());clients.get(account.id).add(ws);ws.send(JSON.stringify({type:'connected',accountId:account.id}));ws.on('close',()=>clients.get(account.id)?.delete(ws));}catch{try{ws.close()}catch{}}});
+async function initDb() {
+  if (!pool) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone_digits CHAR(4) NOT NULL,
+      password_hash TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS accounts (
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      code VARCHAR(12) NOT NULL UNIQUE,
+      created_by BIGINT REFERENCES users(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS memberships (
+      id BIGSERIAL PRIMARY KEY,
+      account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(account_id,user_id)
+    );
+    CREATE TABLE IF NOT EXISTS records (
+      id BIGSERIAL PRIMARY KEY,
+      account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      user_id BIGINT NOT NULL REFERENCES users(id),
+      type VARCHAR(12) NOT NULL CHECK(type IN ('deposit','withdraw')),
+      amount NUMERIC(14,2) NOT NULL CHECK(amount > 0),
+      bank TEXT,
+      description TEXT,
+      receipt BYTEA,
+      receipt_name TEXT,
+      receipt_type TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);
+    CREATE INDEX IF NOT EXISTS idx_records_account_date ON records(account_id, created_at DESC);
+  `);
+  // Safe compatibility additions for older databases.
+  await dbQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+  await dbQuery(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS code VARCHAR(12)`);
+}
 
-// SPA fallback after API routes.
-app.get('/{*splat}',(req,res)=>res.sendFile(path.join(ROOT,'index.html')));
+function nextId(kind) { return seq[kind]++; }
+function now() { return new Date().toISOString(); }
+function cleanName(v) { return String(v || '').trim().replace(/\s+/g,' '); }
+function digits4(v) { return String(v || '').replace(/\D/g,'').slice(-4); }
+function money(v) { const n = Number(v); return Number.isFinite(n) ? Math.round(n*100)/100 : NaN; }
+function accountCode() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
+function signToken(id) {
+  const payload = `${id}.${Date.now()}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
+  return Buffer.from(`${payload}.${sig}`).toString('base64url');
+}
+function verifyToken(token) {
+  try {
+    const raw = Buffer.from(token,'base64url').toString('utf8');
+    const parts = raw.split('.');
+    if (parts.length !== 3) return null;
+    const [id,ts,sig] = parts;
+    const expected = crypto.createHmac('sha256', SESSION_SECRET).update(`${id}.${ts}`).digest('hex');
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    if (Date.now() - Number(ts) > 1000*60*60*24*30) return null;
+    return Number(id);
+  } catch { return null; }
+}
+function setSession(res,userId) {
+  const token = signToken(userId);
+  res.cookie('pv_session', token, {httpOnly:true, sameSite:'lax', secure:isProd, maxAge:1000*60*60*24*30, path:'/'});
+  // Also return a header token for environments where cookie handling is restricted.
+  res.setHeader('X-Poolvault-Session', token);
+  return token;
+}
+function parseCookies(req) {
+  const h = req.headers.cookie || '';
+  const out = {};
+  h.split(';').forEach(x=>{const i=x.indexOf('='); if(i>0) out[x.slice(0,i).trim()] = decodeURIComponent(x.slice(i+1));});
+  return out;
+}
+async function authUser(req,res,next) {
+  const token = parseCookies(req).pv_session || req.headers['x-poolvault-session'] || '';
+  const userId = verifyToken(token);
+  if (!userId) return res.status(401).json({ok:false,error:'Sessão expirada. Faça login novamente.'});
+  const user = await getUser(userId);
+  if (!user) return res.status(401).json({ok:false,error:'Usuário não encontrado.'});
+  req.user = user;
+  next();
+}
 
-server.listen(PORT,'0.0.0.0',()=>{
-  console.log(`Poolvault listening on 0.0.0.0:${PORT} | ${USE_PG?'PostgreSQL':'memory fallback'}`);
-  if(pool)db().then(()=>console.log('PostgreSQL schema ready')).catch(e=>console.error('PostgreSQL startup check failed:',e.message));
+async function getUser(id) {
+  if (pool) {
+    const r = await dbQuery('SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE id=$1',[id]);
+    return r.rows[0] || null;
+  }
+  return mem.users.find(x=>x.id===id) || null;
+}
+async function getAccountForUser(userId) {
+  if (pool) {
+    const r = await dbQuery(`SELECT a.id,a.name,a.code FROM accounts a JOIN memberships m ON m.account_id=a.id WHERE m.user_id=$1 ORDER BY a.id LIMIT 1`,[userId]);
+    return r.rows[0] || null;
+  }
+  const m=mem.memberships.find(x=>x.userId===userId); return m ? mem.accounts.find(a=>a.id===m.accountId) : null;
+}
+async function getMembers(accountId) {
+  if (pool) {
+    const r=await dbQuery(`SELECT u.id,u.name,u.phone_digits AS "phoneDigits",u.created_at AS "createdAt" FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.account_id=$1 ORDER BY u.name`,[accountId]);
+    return r.rows;
+  }
+  const ids=mem.memberships.filter(m=>m.accountId===accountId).map(m=>m.userId); return mem.users.filter(u=>ids.includes(u.id));
+}
+async function getRecords(accountId, limit=100) {
+  if (pool) {
+    const r=await dbQuery(`SELECT r.id,r.type,r.amount::float AS amount,r.bank,r.description,r.created_at AS "createdAt",r.user_id AS "userId",u.name AS "userName",r.receipt IS NOT NULL AS "hasReceipt",r.receipt_name AS "receiptName",r.receipt_type AS "receiptType" FROM records r JOIN users u ON u.id=r.user_id WHERE r.account_id=$1 ORDER BY r.created_at DESC LIMIT $2`,[accountId,limit]);
+    return r.rows;
+  }
+  return mem.records.filter(r=>r.accountId===accountId).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,limit).map(r=>({...r,userName:mem.users.find(u=>u.id===r.userId)?.name||'Usuário',hasReceipt:!!r.receipt}));
+}
+async function totals(accountId) {
+  if (pool) {
+    const r=await dbQuery(`SELECT COALESCE(SUM(CASE WHEN type='deposit' THEN amount ELSE -amount END),0)::float AS balance, COALESCE(SUM(CASE WHEN type='deposit' THEN amount ELSE 0 END),0)::float AS deposits, COALESCE(SUM(CASE WHEN type='withdraw' THEN amount ELSE 0 END),0)::float AS withdrawals FROM records WHERE account_id=$1`,[accountId]);
+    return r.rows[0];
+  }
+  const rs=mem.records.filter(r=>r.accountId===accountId); return {balance:rs.reduce((s,r)=>s+(r.type==='deposit'?r.amount:-r.amount),0),deposits:rs.filter(r=>r.type==='deposit').reduce((s,r)=>s+r.amount,0),withdrawals:rs.filter(r=>r.type==='withdraw').reduce((s,r)=>s+r.amount,0)};
+}
+async function userTotal(accountId,userId) {
+  if (pool) { const r=await dbQuery(`SELECT COALESCE(SUM(CASE WHEN type='deposit' THEN amount ELSE -amount END),0)::float AS balance FROM records WHERE account_id=$1 AND user_id=$2`,[accountId,userId]); return r.rows[0].balance; }
+  return mem.records.filter(r=>r.accountId===accountId&&r.userId===userId).reduce((s,r)=>s+(r.type==='deposit'?r.amount:-r.amount),0);
+}
+
+const sockets = new Map();
+function broadcast(accountId, payload) {
+  const set=sockets.get(String(accountId)); if(!set) return;
+  const msg=JSON.stringify(payload);
+  for(const ws of set) if(ws.readyState===1) ws.send(msg);
+}
+
+app.get('/api/health', async (_req,res)=>{
+  let db='memory';
+  if(pool){ try { await dbQuery('SELECT 1'); db='postgres'; } catch { db='postgres-unavailable'; } }
+  res.json({ok:true,db,persistent:!!pool,time:new Date().toISOString()});
 });
+
+app.get('/api/session', async (req,res)=>{
+  try {
+    const token=parseCookies(req).pv_session || req.headers['x-poolvault-session'] || '';
+    const id=verifyToken(token); if(!id) return res.json({ok:true,authenticated:false});
+    const user=await getUser(id); if(!user) return res.json({ok:true,authenticated:false});
+    const account=await getAccountForUser(id); res.json({ok:true,authenticated:true,user,account});
+  } catch(e){ res.status(500).json({ok:false,error:'Falha ao recuperar sessão.'}); }
+});
+
+app.post('/api/auth/signup', async (req,res)=>{
+  const name=cleanName(req.body.name); const phoneDigits=digits4(req.body.phoneDigits);
+  if(name.length<3) return res.status(400).json({ok:false,error:'Informe seu nome completo.'});
+  if(phoneDigits.length!==4) return res.status(400).json({ok:false,error:'Informe os 4 últimos dígitos do celular.'});
+  try {
+    let user,account;
+    if(pool){
+      const client=await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const ur=await client.query(`INSERT INTO users(name,phone_digits) VALUES($1,$2) RETURNING id,name,phone_digits AS "phoneDigits",created_at AS "createdAt"`,[name,phoneDigits]);
+        user=ur.rows[0];
+        const ar=await client.query(`INSERT INTO accounts(name,code,created_by) VALUES($1,$2,$3) RETURNING id,name,code`,[`Conta de ${name.split(' ')[0]}`,accountCode(),user.id]);
+        account=ar.rows[0];
+        await client.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2)`,[account.id,user.id]);
+        await client.query('COMMIT');
+      } catch(e){ await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    } else {
+      user={id:nextId('users'),name,phoneDigits,createdAt:now()}; mem.users.push(user);
+      account={id:nextId('accounts'),name:`Conta de ${name.split(' ')[0]}`,code:accountCode(),createdBy:user.id,createdAt:now()}; mem.accounts.push(account);
+      mem.memberships.push({id:nextId('memberships'),accountId:account.id,userId:user.id,joinedAt:now()});
+    }
+    const token=setSession(res,user.id);
+    res.status(201).json({ok:true,user,profile:user,account,session:token});
+  } catch(e){
+    console.error('[signup]',e);
+    res.status(500).json({ok:false,error:'Não foi possível criar o perfil. Verifique o PostgreSQL do Render.',detail:isProd?undefined:e.message});
+  }
+});
+
+app.post('/api/auth/login', async (req,res)=>{
+  const name=cleanName(req.body.name); const phoneDigits=digits4(req.body.phoneDigits);
+  if(phoneDigits.length!==4) return res.status(400).json({ok:false,error:'Informe os 4 últimos dígitos.'});
+  try{
+    let user;
+    if(pool){const r=await dbQuery(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE phone_digits=$1 AND LOWER(name)=LOWER($2) LIMIT 1`,[phoneDigits,name]); user=r.rows[0];}
+    else user=mem.users.find(u=>u.phoneDigits===phoneDigits && u.name.toLowerCase()===name.toLowerCase());
+    if(!user) return res.status(401).json({ok:false,error:'Perfil não encontrado. Confira nome e os 4 últimos dígitos.'});
+    const account=await getAccountForUser(user.id); setSession(res,user.id); res.json({ok:true,user,profile:user,account});
+  }catch(e){console.error('[login]',e);res.status(500).json({ok:false,error:'Falha ao acessar o sistema.'});}
+});
+
+app.post('/api/auth/logout',(req,res)=>{res.setHeader('Set-Cookie','pv_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax');res.json({ok:true});});
+
+app.get('/api/state',authUser,async(req,res)=>{
+  try{
+    const account=await getAccountForUser(req.user.id); if(!account) return res.status(404).json({ok:false,error:'Conta conjunta não encontrada.'});
+    const [members,records,totalsData,individual]=await Promise.all([getMembers(account.id),getRecords(account.id),totals(account.id),userTotal(account.id,req.user.id)]);
+    res.json({ok:true,user:req.user,account,members,records,totals:totalsData,individualBalance:individual});
+  }catch(e){console.error('[state]',e);res.status(500).json({ok:false,error:'Não foi possível carregar os dados.'});}
+});
+
+app.post('/api/accounts/join',authUser,async(req,res)=>{
+  const code=String(req.body.code||'').trim().toUpperCase(); if(!code) return res.status(400).json({ok:false,error:'Informe o código da conta.'});
+  try{
+    if(pool){const a=await dbQuery('SELECT id,name,code FROM accounts WHERE code=$1',[code]); if(!a.rows[0]) return res.status(404).json({ok:false,error:'Conta não encontrada.'}); await dbQuery('INSERT INTO memberships(account_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[a.rows[0].id,req.user.id]); broadcast(a.rows[0].id,{type:'members_changed'}); return res.json({ok:true,account:a.rows[0]});}
+    const a=mem.accounts.find(x=>x.code===code); if(!a)return res.status(404).json({ok:false,error:'Conta não encontrada.'}); if(!mem.memberships.some(m=>m.accountId===a.id&&m.userId===req.user.id)) mem.memberships.push({id:nextId('memberships'),accountId:a.id,userId:req.user.id,joinedAt:now()}); broadcast(a.id,{type:'members_changed'}); res.json({ok:true,account:a});
+  }catch(e){res.status(500).json({ok:false,error:'Não foi possível entrar na conta.'});}
+});
+
+app.post('/api/records',authUser,upload.single('receipt'),async(req,res)=>{
+  const type=req.body.type==='withdraw'?'withdraw':'deposit'; const amount=money(req.body.amount); const bank=String(req.body.bank||'').trim(); const description=String(req.body.description||'').trim();
+  if(!Number.isFinite(amount)||amount<=0)return res.status(400).json({ok:false,error:'Informe um valor válido.'});
+  try{
+    const account=await getAccountForUser(req.user.id); if(!account)return res.status(400).json({ok:false,error:'Você ainda não pertence a uma conta conjunta.'});
+    if(pool){
+      const r=await dbQuery(`INSERT INTO records(account_id,user_id,type,amount,bank,description,receipt,receipt_name,receipt_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,type,amount::float AS amount,bank,description,created_at AS "createdAt",user_id AS "userId",(receipt IS NOT NULL) AS "hasReceipt"`,[account.id,req.user.id,type,amount,bank,description,req.file?.buffer||null,req.file?.originalname||null,req.file?.mimetype||null]);
+      const record={...r.rows[0],userName:req.user.name}; broadcast(account.id,{type:'record_created',record}); return res.status(201).json({ok:true,record});
+    }
+    const record={id:nextId('records'),accountId:account.id,userId:req.user.id,type,amount,bank,description,receipt:req.file?{buffer:req.file.buffer,name:req.file.originalname,type:req.file.mimetype}:null,createdAt:now()}; mem.records.push(record); const out={...record,userName:req.user.name,hasReceipt:!!record.receipt}; broadcast(account.id,{type:'record_created',record:out}); res.status(201).json({ok:true,record:out});
+  }catch(e){console.error('[record]',e);res.status(500).json({ok:false,error:'Não foi possível registrar o movimento.'});}
+});
+
+app.get('/api/records/:id/receipt',authUser,async(req,res)=>{
+  try{
+    const account=await getAccountForUser(req.user.id); if(!account)return res.sendStatus(404);
+    if(pool){const r=await dbQuery('SELECT receipt,receipt_name,receipt_type FROM records WHERE id=$1 AND account_id=$2',[req.params.id,account.id]); if(!r.rows[0]?.receipt)return res.sendStatus(404); res.setHeader('Content-Type',r.rows[0].receipt_type||'application/octet-stream');res.setHeader('Content-Disposition',`inline; filename="${String(r.rows[0].receipt_name||'comprovante').replace(/"/g,'')}"`);return res.end(r.rows[0].receipt);}
+    const r=mem.records.find(x=>x.id===Number(req.params.id)&&x.accountId===account.id);if(!r?.receipt)return res.sendStatus(404);res.setHeader('Content-Type',r.receipt.type);return res.end(r.receipt.buffer);
+  }catch(e){res.sendStatus(500);}
+});
+
+// Serve the three frontend files from project root. No public/ directory.
+app.get('/styles.css',(_req,res)=>res.sendFile(require('path').join(__dirname,'styles.css')));
+app.get('/app.js',(_req,res)=>res.sendFile(require('path').join(__dirname,'app.js')));
+app.get('/',(_req,res)=>res.sendFile(require('path').join(__dirname,'index.html')));
+app.get(/.*/,(req,res)=>{ if(req.path.startsWith('/api/')) return res.status(404).json({ok:false,error:'Rota não encontrada.'}); res.sendFile(require('path').join(__dirname,'index.html')); });
+
+app.use((err,_req,res,_next)=>{console.error('[error]',err);res.status(400).json({ok:false,error:err.message||'Erro inesperado.'});});
+
+const wss=new WebSocketServer({server,path:'/ws'});
+wss.on('connection',async(ws,req)=>{
+  try{
+    const u=new URL(req.url,'http://localhost'); const token=u.searchParams.get('token') || ''; const uid=verifyToken(token); if(!uid){ws.close(1008,'unauthorized');return;}
+    const account=await getAccountForUser(uid); if(!account){ws.close(1008,'no-account');return;}
+    const key=String(account.id); if(!sockets.has(key))sockets.set(key,new Set()); sockets.get(key).add(ws);
+    ws.send(JSON.stringify({type:'connected',accountId:account.id}));
+    ws.on('close',()=>{const set=sockets.get(key);if(set){set.delete(ws);if(!set.size)sockets.delete(key);}});
+  }catch{ws.close(1011,'server-error');}
+});
+
+server.listen(PORT,'0.0.0.0',()=>console.log(`Poolvault running on 0.0.0.0:${PORT} | postgres=${!!pool}`));
+
+(async()=>{if(pool){try{await initDb();console.log('PostgreSQL schema ready.')}catch(e){console.error('PostgreSQL unavailable at startup:',e.message)}}})();

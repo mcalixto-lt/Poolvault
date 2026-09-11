@@ -2,6 +2,7 @@ services:
   - type: web
     name: poolvault
     runtime: node
+    plan: free
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /api/health
@@ -10,12 +11,12 @@ services:
         fromDatabase:
           name: poolvault-db
           property: connectionString
-      - key: JWT_SECRET
-        generateValue: true
       - key: NODE_ENV
         value: production
-
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: PORT
+        value: 10000
 databases:
   - name: poolvault-db
-    databaseName: poolvault
-    user: poolvault
+    plan: free
