@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: poolvault
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: poolvault-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+
+databases:
+  - name: poolvault-db
+    databaseName: poolvault
+    user: poolvault
