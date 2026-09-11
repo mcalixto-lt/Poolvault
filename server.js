@@ -22,7 +22,14 @@ const upload = multer({ storage:multer.memoryStorage(), limits:{fileSize:3*1024*
 
 app.use(express.json({limit:'200kb'}));
 app.use(cookieParser());
-app.use(express.static('public', { extensions:['html'] }));
+// Os arquivos do frontend ficam na raiz do projeto para facilitar o deploy no Render.
+const ROOT = process.cwd();
+app.get('/', (req,res)=>res.sendFile(ROOT+'/index.html'));
+app.get('/index.html', (req,res)=>res.sendFile(ROOT+'/index.html'));
+app.get('/styles.css', (req,res)=>res.sendFile(ROOT+'/styles.css'));
+app.get('/app.js', (req,res)=>res.sendFile(ROOT+'/app.js'));
+app.get('/manifest.webmanifest', (req,res)=>res.sendFile(ROOT+'/manifest.webmanifest'));
+
 
 const uid=()=>crypto.randomUUID();
 const accountCode=()=>crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -59,7 +66,7 @@ function broadcast(accountId,message){const set=clients.get(accountId);if(!set)r
 app.get('/api/health',(req,res)=>res.json({ok:true,db:usePg?'postgres':'memory',time:new Date().toISOString()}));
 app.get('/api/session',async(req,res)=>{try{const t=req.cookies.pv_auth;if(!t)return res.json({ok:true,authenticated:false});const p=jwt.verify(t,JWT_SECRET);const user=await findUserById(p.sub);if(!user)return res.json({ok:true,authenticated:false});const account=await accountForUser(user.id);return res.json({ok:true,authenticated:true,user,account});}catch{return res.json({ok:true,authenticated:false})}});
 
-app.post('/api/auth/signup',async(req,res)=>{try{const name=cleanName(req.body.name), digits=String(req.body.phoneDigits||''), code=String(req.body.accountCode||'').trim().toUpperCase();if(name.split(' ').length<2)return sendError(res,400,'Informe nome e sobrenome.');if(!/^\d{4}$/.test(digits))return sendError(res,400,'Digite os 4 últimos dígitos.');if(await findUserByDigits(digits))return sendError(res,409,'Já existe um perfil com esses 4 dígitos.');let account=null;if(code){account=await findAccountByCode(code);if(!account)return sendError(res,404,'Código da conta não encontrado.');}const user=await createUser({id:uid(),name,short:shortName(name),initial:initial(name),phoneDigits:digits,createdAt:new Date().toISOString()});if(account){await joinAccount(user,account);}else account=await createAccountFor(user,name);setAuth(res,user);res.json({ok:true,user,account});}catch(e){console.error(e);sendError(res,500,'Não foi possível concluir o cadastro.')}});
+app.post('/api/auth/signup',async(req,res)=>{try{const name=cleanName(req.body.name), digits=String(req.body.phoneDigits||''), code=String(req.body.accountCode||'').trim().toUpperCase();if(name.split(' ').length<2)return sendError(res,400,'Informe nome e sobrenome.');if(!/^\d{4}$/.test(digits))return sendError(res,400,'Digite os 4 últimos dígitos.');let account=null;if(code){account=await findAccountByCode(code);if(!account)return sendError(res,404,'Código da conta não encontrado.');}const user=await createUser({id:uid(),name,short:shortName(name),initial:initial(name),phoneDigits:digits,createdAt:new Date().toISOString()});if(account){await joinAccount(user,account);}else account=await createAccountFor(user,name);setAuth(res,user);res.json({ok:true,user,account});}catch(e){console.error(e);sendError(res,500,'Não foi possível concluir o cadastro.')}});
 app.post('/api/auth/login',async(req,res)=>{try{const digits=String(req.body.phoneDigits||'');if(!/^\d{4}$/.test(digits))return sendError(res,400,'Digite os 4 últimos dígitos.');const user=await findUserByDigits(digits);if(!user)return sendError(res,404,'Perfil não encontrado.');setAuth(res,user);res.json({ok:true,user,account:await accountForUser(user.id)});}catch(e){sendError(res,500,'Falha no login.')}});
 app.post('/api/auth/logout',(req,res)=>{res.clearCookie('pv_auth');res.json({ok:true})});
 
@@ -77,7 +84,7 @@ const wss=new WebSocketServer({noServer:true});
 server.on('upgrade',(request,socket,head)=>{if(request.url!=='/ws'){socket.destroy();return;}wss.handleUpgrade(request,socket,head,ws=>wss.emit('connection',ws,request));});
 wss.on('connection',async(ws,req)=>{try{const cookies=Object.fromEntries((req.headers.cookie||'').split(';').filter(Boolean).map(x=>{const i=x.indexOf('=');return [x.slice(0,i).trim(),decodeURIComponent(x.slice(i+1))]}));const p=jwt.verify(cookies.pv_auth,JWT_SECRET);const account=await accountForUser(p.sub);if(!account){ws.close();return;}if(!clients.has(account.id))clients.set(account.id,new Set());clients.get(account.id).add(ws);ws.send(JSON.stringify({type:'connected',accountId:account.id}));ws.on('close',()=>clients.get(account.id)?.delete(ws));}catch{ws.close();}});
 
-app.get('/{*splat}',(req,res)=>res.sendFile(process.cwd()+'/public/index.html'));
+app.get('/{*splat}',(req,res)=>res.sendFile(ROOT+'/index.html'));
 
 server.listen(PORT,'0.0.0.0',async()=>{
   console.log(`Poolvault rodando em http://0.0.0.0:${PORT} | DB: ${usePg?'PostgreSQL':'memória'}`);
