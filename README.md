@@ -1,34 +1,48 @@
-# Poolvault — estrutura completa
+# Poolvault
 
-Aplicação mobile-first com o layout da primeira versão aprovada, cadastro de perfis, contas conjuntas, PostgreSQL e sincronização por WebSocket.
+Sistema mobile-first de conta conjunta com PostgreSQL e sincronização em tempo real.
 
 ## Estrutura
 
-Todos os arquivos do frontend ficam na raiz. Não existe pasta `public/`.
+Todos os arquivos do frontend ficam na raiz. Não existe pasta `public`.
 
 - `index.html`
-- `styles.css`
 - `app.js`
+- `styles.css`
 - `server.js`
 - `package.json`
 - `render.yaml`
+- `manifest.webmanifest`
 
 ## Render
 
-Build: `npm install`
+O `render.yaml` cria um Web Service Node e um PostgreSQL. O serviço usa:
 
-Start: `npm start`
-
-O `render.yaml` cria um Web Service e um PostgreSQL. O servidor usa `DATABASE_URL` como fonte oficial dos dados.
+- Build: `npm install`
+- Start: `npm start`
+- Health check: `/api/health`
 
 ## Cadastro
 
-O primeiro perfil cria automaticamente uma conta conjunta e recebe um código de convite. Outros perfis são independentes e podem entrar na conta pelo menu Membros.
+O usuário informa nome completo e os quatro últimos dígitos do celular. O servidor cria, em uma única transação PostgreSQL:
+
+1. perfil do usuário;
+2. conta conjunta;
+3. vínculo do usuário à conta;
+4. sessão autenticada.
+
+A resposta do cadastro contém `ok`, `user`, `profile`, `account` e `session`.
 
 ## Sincronização
 
-PostgreSQL é a fonte de verdade. WebSocket transmite alterações de membros e lançamentos para os clientes conectados à mesma conta.
+PostgreSQL é a fonte central. WebSocket transmite eventos de novos registros e alterações de membros aos usuários conectados à mesma conta conjunta.
 
-## Diagnóstico
+## Comprovantes
 
-`/api/health` informa se o PostgreSQL está conectado. Em produção, com `DATABASE_URL`, o sistema não usa o fallback em memória.
+Imagens e PDFs de até 5 MB são armazenados associados ao lançamento e podem ser visualizados por membros autenticados da mesma conta.
+
+## Teste
+
+Depois do deploy, abra `/api/health`. O resultado esperado é:
+
+`{"ok":true,"db":"postgres","persistent":true}`
