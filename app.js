@@ -85,11 +85,13 @@
         body: JSON.stringify({ name, phoneDigits })
       });
 
-      if (!data.ok || !data.user || !data.account || !data.session) {
-        throw new Error('O servidor não concluiu a criação do perfil.');
+      const createdUser = data.user || data.profile;
+      if (!data.ok || !createdUser || !data.account) {
+        const missing = [!createdUser && 'perfil', !data.account && 'conta', !data.session && 'sessão'].filter(Boolean).join(', ');
+        throw new Error(data.error || `Cadastro incompleto no servidor${missing ? `: ${missing}` : ''}.`);
       }
 
-      state.user = data.user;
+      state.user = createdUser;
       state.account = data.account;
       await new Promise(resolve => setTimeout(resolve, 900));
       showView('view-success');

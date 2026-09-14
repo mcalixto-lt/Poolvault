@@ -1,48 +1,44 @@
-# Poolvault
+# Poolvault — versão estável
 
-Sistema mobile-first de conta conjunta com PostgreSQL e sincronização em tempo real.
+Sistema mobile-first de conta conjunta. A interface da primeira versão foi mantida e o backend foi refeito para não depender de `cookie-parser` e para não falhar quando o Render ainda não estiver com `DATABASE_URL` disponível.
 
-## Estrutura
+## Armazenamento
 
-Todos os arquivos do frontend ficam na raiz. Não existe pasta `public`.
-
-- `index.html`
-- `app.js`
-- `styles.css`
-- `server.js`
-- `package.json`
-- `render.yaml`
-- `manifest.webmanifest`
-
-## Render
-
-O `render.yaml` cria um Web Service Node e um PostgreSQL. O serviço usa:
-
-- Build: `npm install`
-- Start: `npm start`
-- Health check: `/api/health`
+- Com `DATABASE_URL`: usa PostgreSQL, recomendado para Render e sincronização entre usuários.
+- Sem `DATABASE_URL`: usa um arquivo local `data/poolvault.json`, permitindo testar o sistema imediatamente. Esse modo é apenas para testes locais/temporários.
 
 ## Cadastro
 
-O usuário informa nome completo e os quatro últimos dígitos do celular. O servidor cria, em uma única transação PostgreSQL:
-
-1. perfil do usuário;
-2. conta conjunta;
-3. vínculo do usuário à conta;
-4. sessão autenticada.
-
-A resposta do cadastro contém `ok`, `user`, `profile`, `account` e `session`.
-
-## Sincronização
-
-PostgreSQL é a fonte central. WebSocket transmite eventos de novos registros e alterações de membros aos usuários conectados à mesma conta conjunta.
+Nome completo + 4 últimos dígitos. O servidor cria perfil, conta conjunta, vínculo e sessão em uma única operação. A resposta sempre retorna `ok`, `user`, `profile`, `account` e `session`.
 
 ## Comprovantes
 
-Imagens e PDFs de até 5 MB são armazenados associados ao lançamento e podem ser visualizados por membros autenticados da mesma conta.
+Imagens e PDF de até 5 MB. O comprovante fica vinculado ao lançamento e pode ser visualizado pelos membros autenticados da mesma conta.
 
-## Teste
+## Sincronização
 
-Depois do deploy, abra `/api/health`. O resultado esperado é:
+Com PostgreSQL e WebSocket, novos lançamentos e novos membros são propagados para os usuários conectados à mesma conta.
+
+## Render
+
+Use o `render.yaml` incluído ou crie um Web Service Node e configure:
+
+- Build: `npm install`
+- Start: `npm start`
+- `DATABASE_URL`: connection string do PostgreSQL
+- `SESSION_SECRET`: uma chave forte
+
+Health check: `/api/health`.
+
+Resultado esperado com PostgreSQL:
 
 `{"ok":true,"db":"postgres","persistent":true}`
+
+## Teste local
+
+1. Instale Node.js 20+.
+2. Execute `npm install`.
+3. Execute `npm start`.
+4. Abra `http://localhost:10000`.
+
+Sem `DATABASE_URL`, o sistema utiliza o armazenamento local para o teste.

@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('http');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
@@ -14,6 +15,8 @@ const PORT = Number(process.env.PORT || 10000);
 const SESSION_SECRET = process.env.SESSION_SECRET || 'poolvault-development-secret-change-me';
 const isProd = process.env.NODE_ENV === 'production';
 const DATABASE_URL = process.env.DATABASE_URL || '';
+const DATA_DIR = process.env.POOLVAULT_DATA_DIR || path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'poolvault.json');
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
@@ -35,17 +38,43 @@ const pool = DATABASE_URL ? new Pool({
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000
 }) : null;
-
 if (pool) pool.on('error', err => console.error('[postgres]', err));
 
-let dbReady;
-if (pool) {
-  dbReady = initDb();
-} else {
-  dbReady = Promise.resolve();
-}
+const memory = {
+  users: [], accounts: [], memberships: [], records: [],
+  seq: { users: 1, accounts: 1, memberships: 1, records: 1 },
+  loaded: false
+};
+let fileSaveQueue = Promise.resolve();
 
-async function initDb() {
+function fileStoreLoad() {
+  if (memory.loaded) return;
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      for (const key of ['users','accounts','memberships','records']) memory[key] = Array.isArray(raw[key]) ? raw[key] : [];
+      memory.seq = raw.seq || memory.seq;
+    } catch (err) {
+      console.error('[filedb] arquivo inválido, iniciando banco vazio:', err.message);
+    }
+  }
+  memory.loaded = true;
+}
+function fileStoreSave() {
+  fileSaveQueue = fileSaveQueue.then(async () => {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ ...memory, savedAt: new Date().toISOString() }, null, 2));
+    fs.renameSync(tmp, DATA_FILE);
+  }).catch(err => console.error('[filedb] save:', err));
+  return fileSaveQueue;
+}
+function clone(v) { return JSON.parse(JSON.stringify(v)); }
+
+let dbReady = null;
+async function initPg() {
+  if (!pool) return;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -90,17 +119,20 @@ async function initDb() {
     await client.query('COMMIT');
     console.log('[db] PostgreSQL schema ready');
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[db] schema initialization failed:', err);
+    await client.query('ROLLBACK').catch(() => {});
     throw err;
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
+}
+async function ensureDb() {
+  if (!pool) return;
+  if (!dbReady) dbReady = initPg().catch(err => { dbReady = null; throw err; });
+  await dbReady;
 }
 
-async function requireDatabase() {
-  if (!pool) throw Object.assign(new Error('DATABASE_URL não está configurada no Render.'), { code: 'DATABASE_NOT_CONFIGURED' });
-  await dbReady;
+function storageType() { return pool ? 'postgres' : 'file'; }
+async function requireStorage() {
+  if (pool) { await ensureDb(); return; }
+  fileStoreLoad();
 }
 
 function cleanName(value) { return String(value || '').trim().replace(/\s+/g, ' '); }
@@ -118,8 +150,7 @@ function verifyToken(token) {
     const [id, timestamp, signature] = raw.split('.');
     if (!id || !timestamp || !signature) return null;
     const expected = crypto.createHmac('sha256', SESSION_SECRET).update(`${id}.${timestamp}`).digest('hex');
-    if (signature.length !== expected.length) return null;
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
     if (!Number.isFinite(Number(timestamp)) || Date.now() - Number(timestamp) > 30 * 24 * 60 * 60 * 1000) return null;
     return Number(id);
   } catch { return null; }
@@ -127,8 +158,8 @@ function verifyToken(token) {
 function parseCookies(req) {
   const out = {};
   String(req.headers.cookie || '').split(';').forEach(part => {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1));
+    const i = part.indexOf('='); if (i <= 0) return;
+    try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1)); } catch {}
   });
   return out;
 }
@@ -138,211 +169,173 @@ function setSession(res, userId) {
   res.setHeader('Set-Cookie', `pv_session=${encodeURIComponent(token)}; ${flags}`);
   return token;
 }
-function clearSession(res) {
-  res.setHeader('Set-Cookie', `pv_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${isProd ? '; Secure' : ''}`);
-}
-function requestUserId(req) {
-  const cookies = parseCookies(req);
-  return verifyToken(cookies.pv_session || req.headers['x-poolvault-session'] || '');
-}
+function clearSession(res) { res.setHeader('Set-Cookie', `pv_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${isProd ? '; Secure' : ''}`); }
+function requestUserId(req) { const c = parseCookies(req); return verifyToken(c.pv_session || req.headers['x-poolvault-session'] || ''); }
+
+function normalizeUser(u) { return u ? { id:Number(u.id), name:u.name, phoneDigits:u.phoneDigits ?? u.phone_digits, createdAt:u.createdAt ?? u.created_at } : null; }
+function normalizeAccount(a) { return a ? { id:Number(a.id), name:a.name, code:a.code } : null; }
+function normalizeRecord(r) { return r ? { id:Number(r.id), type:r.type, amount:Number(r.amount), bank:r.bank || '', description:r.description || '', createdAt:r.createdAt ?? r.created_at, userId:Number(r.userId ?? r.user_id), userName:r.userName ?? r.user_name, hasReceipt:Boolean(r.hasReceipt ?? r.has_receipt) } : null; }
 
 async function getUser(id) {
-  const r = await pool.query(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE id=$1`, [id]);
-  return r.rows[0] || null;
+  await requireStorage();
+  if (pool) {
+    const r = await pool.query(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE id=$1`, [id]);
+    return normalizeUser(r.rows[0]);
+  }
+  return normalizeUser(memory.users.find(u => Number(u.id) === Number(id)));
 }
 async function getAccount(userId) {
-  const r = await pool.query(`SELECT a.id,a.name,a.code FROM accounts a JOIN memberships m ON m.account_id=a.id WHERE m.user_id=$1 ORDER BY a.id LIMIT 1`, [userId]);
-  return r.rows[0] || null;
+  await requireStorage();
+  if (pool) {
+    const r = await pool.query(`SELECT a.id,a.name,a.code FROM accounts a JOIN memberships m ON m.account_id=a.id WHERE m.user_id=$1 ORDER BY a.id LIMIT 1`, [userId]);
+    return normalizeAccount(r.rows[0]);
+  }
+  const mem = memory.memberships.filter(m => Number(m.userId) === Number(userId)).sort((a,b) => Number(a.accountId)-Number(b.accountId))[0];
+  return mem ? normalizeAccount(memory.accounts.find(a => Number(a.id) === Number(mem.accountId))) : null;
 }
 async function getMembers(accountId) {
-  const r = await pool.query(`SELECT u.id,u.name,u.phone_digits AS "phoneDigits",u.created_at AS "createdAt",m.joined_at AS "joinedAt",m.id AS "membershipId",m.user_id AS "userId" FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.account_id=$1 ORDER BY u.name`, [accountId]);
-  return r.rows;
+  await requireStorage();
+  if (pool) {
+    const r = await pool.query(`SELECT u.id,u.name,u.phone_digits AS "phoneDigits",u.created_at AS "createdAt",m.joined_at AS "joinedAt",m.id AS "membershipId",m.user_id AS "userId" FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.account_id=$1 ORDER BY u.name`, [accountId]);
+    return r.rows.map(x => ({...x, id:Number(x.id), userId:Number(x.userId), membershipId:Number(x.membershipId)}));
+  }
+  return memory.memberships.filter(m => Number(m.accountId) === Number(accountId)).map(m => {
+    const u = memory.users.find(x => Number(x.id) === Number(m.userId));
+    return { id:Number(u.id), userId:Number(u.id), name:u.name, phoneDigits:u.phoneDigits, createdAt:u.createdAt, joinedAt:m.joinedAt, membershipId:Number(m.id) };
+  }).sort((a,b)=>a.name.localeCompare(b.name));
 }
 async function getRecords(accountId) {
-  const r = await pool.query(`SELECT r.id,r.type,r.amount::float AS amount,r.bank,r.description,r.created_at AS "createdAt",r.user_id AS "userId",u.name AS "userName",(r.receipt IS NOT NULL) AS "hasReceipt" FROM records r JOIN users u ON u.id=r.user_id WHERE r.account_id=$1 ORDER BY r.created_at DESC LIMIT 200`, [accountId]);
-  return r.rows;
+  await requireStorage();
+  if (pool) {
+    const r = await pool.query(`SELECT r.id,r.type,r.amount::float AS amount,r.bank,r.description,r.created_at AS "createdAt",r.user_id AS "userId",u.name AS "userName",(r.receipt IS NOT NULL) AS "hasReceipt" FROM records r JOIN users u ON u.id=r.user_id WHERE r.account_id=$1 ORDER BY r.created_at DESC LIMIT 200`, [accountId]);
+    return r.rows.map(normalizeRecord);
+  }
+  return memory.records.filter(r => Number(r.accountId) === Number(accountId)).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,200).map(normalizeRecord);
 }
 async function getTotals(accountId, userId) {
-  const [total, personal] = await Promise.all([
-    pool.query(`SELECT COALESCE(SUM(CASE WHEN type='dep' THEN amount ELSE 0 END),0)::float AS dep, COALESCE(SUM(CASE WHEN type='wit' THEN amount ELSE 0 END),0)::float AS wit FROM records WHERE account_id=$1`, [accountId]),
-    pool.query(`SELECT COALESCE(SUM(CASE WHEN type='dep' THEN amount ELSE -amount END),0)::float AS balance FROM records WHERE account_id=$1 AND user_id=$2`, [accountId, userId])
-  ]);
-  const dep = Number(total.rows[0].dep || 0);
-  const wit = Number(total.rows[0].wit || 0);
-  return { dep, wit, balance: dep - wit, individualBalance: Number(personal.rows[0].balance || 0) };
+  await requireStorage();
+  if (pool) {
+    const [total, personal] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(CASE WHEN type='dep' THEN amount ELSE 0 END),0)::float AS dep, COALESCE(SUM(CASE WHEN type='wit' THEN amount ELSE 0 END),0)::float AS wit FROM records WHERE account_id=$1`, [accountId]),
+      pool.query(`SELECT COALESCE(SUM(CASE WHEN type='dep' THEN amount ELSE -amount END),0)::float AS balance FROM records WHERE account_id=$1 AND user_id=$2`, [accountId, userId])
+    ]);
+    const dep=Number(total.rows[0].dep||0), wit=Number(total.rows[0].wit||0);
+    return { dep,wit,balance:dep-wit,individualBalance:Number(personal.rows[0].balance||0) };
+  }
+  const recs = memory.records.filter(r => Number(r.accountId) === Number(accountId));
+  const dep = recs.filter(r=>r.type==='dep').reduce((s,r)=>s+Number(r.amount),0);
+  const wit = recs.filter(r=>r.type==='wit').reduce((s,r)=>s+Number(r.amount),0);
+  const personal = recs.filter(r=>Number(r.userId)===Number(userId)).reduce((s,r)=>s+(r.type==='dep'?1:-1)*Number(r.amount),0);
+  return { dep,wit,balance:dep-wit,individualBalance:personal };
 }
 
-async function auth(req, res, next) {
+async function auth(req,res,next){
   try {
-    await requireDatabase();
-    const userId = requestUserId(req);
-    if (!userId) return res.status(401).json({ ok:false, error:'Sessão não encontrada. Faça login novamente.' });
-    const user = await getUser(userId);
-    if (!user) return res.status(401).json({ ok:false, error:'Perfil não encontrado.' });
-    req.user = user;
-    next();
-  } catch (err) {
-    console.error('[auth]', err);
-    res.status(503).json({ ok:false, error:'Banco de dados indisponível. Verifique a conexão PostgreSQL do Render.' });
-  }
+    await requireStorage();
+    const userId=requestUserId(req); if(!userId) return res.status(401).json({ok:false,error:'Sessão não encontrada. Faça login novamente.'});
+    const user=await getUser(userId); if(!user) return res.status(401).json({ok:false,error:'Perfil não encontrado.'});
+    req.user=user; next();
+  } catch(err){ console.error('[auth]',err); res.status(503).json({ok:false,error:'Banco de dados indisponível. Verifique a configuração de armazenamento.',detail: isProd ? undefined : err.message}); }
 }
 
-app.get('/api/health', async (_req, res) => {
-  if (!pool) return res.status(503).json({ ok:false, db:'not-configured', persistent:false });
-  try { await dbReady; await pool.query('SELECT 1'); res.json({ ok:true, db:'postgres', persistent:true }); }
-  catch (err) { res.status(503).json({ ok:false, db:'postgres-error', persistent:true, error: err.message }); }
-});
-
-app.get('/api/session', async (req, res) => {
-  if (!pool) return res.json({ ok:true, authenticated:false });
+app.get('/api/health', async (_req,res)=>{
   try {
-    await dbReady;
-    const userId = requestUserId(req);
-    if (!userId) return res.json({ ok:true, authenticated:false });
-    const user = await getUser(userId);
-    const account = user ? await getAccount(user.id) : null;
-    if (!user || !account) return res.json({ ok:true, authenticated:false });
-    res.json({ ok:true, authenticated:true, user, profile:user, account });
-  } catch (err) {
-    console.error('[session]', err);
-    res.status(503).json({ ok:false, error:'Banco de dados indisponível.' });
-  }
+    await requireStorage();
+    if (pool) { await pool.query('SELECT 1'); return res.json({ok:true,db:'postgres',persistent:true}); }
+    return res.json({ok:true,db:'file',persistent:true,note:'Configure DATABASE_URL no Render para usar PostgreSQL.'});
+  } catch(err){ console.error('[health]',err); res.status(503).json({ok:false,db:storageType(),persistent:false,error:isProd?'Storage indisponível.':err.message}); }
 });
 
-app.post('/api/auth/signup', async (req, res) => {
-  const name = cleanName(req.body.name);
-  const phoneDigits = digits4(req.body.phoneDigits);
-  if (name.split(/\s+/).length < 2) return res.status(400).json({ ok:false, error:'Informe nome e sobrenome.' });
-  if (!/^\d{4}$/.test(phoneDigits)) return res.status(400).json({ ok:false, error:'Informe os 4 últimos dígitos do celular.' });
+app.get('/api/session', async (req,res)=>{
+  try {
+    await requireStorage(); const userId=requestUserId(req); if(!userId) return res.json({ok:true,authenticated:false});
+    const user=await getUser(userId), account=user?await getAccount(user.id):null;
+    if(!user||!account) return res.json({ok:true,authenticated:false});
+    res.json({ok:true,authenticated:true,user,profile:user,account});
+  } catch(err){ console.error('[session]',err); res.status(503).json({ok:false,error:'Não foi possível verificar a sessão.',detail:isProd?undefined:err.message}); }
+});
 
+app.post('/api/auth/signup', async (req,res)=>{
+  const name=cleanName(req.body.name), phoneDigits=digits4(req.body.phoneDigits);
+  if(name.split(/\s+/).length<2) return res.status(400).json({ok:false,error:'Informe nome e sobrenome.'});
+  if(!/^\d{4}$/.test(phoneDigits)) return res.status(400).json({ok:false,error:'Informe os 4 últimos dígitos do celular.'});
   let client;
   try {
-    await requireDatabase();
-    client = await pool.connect();
-    await client.query('BEGIN');
-    const userResult = await client.query(`INSERT INTO users(name,phone_digits) VALUES($1,$2) RETURNING id,name,phone_digits AS "phoneDigits",created_at AS "createdAt"`, [name, phoneDigits]);
-    const user = userResult.rows[0];
-    const accountResult = await client.query(`INSERT INTO accounts(name,code,created_by) VALUES($1,$2,$3) RETURNING id,name,code`, [`Conta de ${name.split(' ')[0]}`, code(), user.id]);
-    const account = accountResult.rows[0];
-    await client.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2)`, [account.id, user.id]);
-    await client.query('COMMIT');
-    const session = setSession(res, user.id);
-    console.log(`[signup] perfil=${user.id} conta=${account.id}`);
-    return res.status(201).json({ ok:true, user, profile:user, account, session });
-  } catch (err) {
-    if (client) { try { await client.query('ROLLBACK'); } catch {} }
-    console.error('[signup]', err);
-    const message = err.code === 'DATABASE_NOT_CONFIGURED' ? 'DATABASE_URL não está configurada no Render.' : 'Não foi possível criar o perfil no PostgreSQL.';
-    return res.status(err.code === 'DATABASE_NOT_CONFIGURED' ? 503 : 500).json({ ok:false, error:message });
-  } finally { if (client) client.release(); }
+    await requireStorage();
+    let user, account;
+    if(pool){
+      client=await pool.connect(); await client.query('BEGIN');
+      const userResult=await client.query(`INSERT INTO users(name,phone_digits) VALUES($1,$2) RETURNING id,name,phone_digits AS "phoneDigits",created_at AS "createdAt"`,[name,phoneDigits]);
+      user=normalizeUser(userResult.rows[0]);
+      const accountResult=await client.query(`INSERT INTO accounts(name,code,created_by) VALUES($1,$2,$3) RETURNING id,name,code`,[`Conta de ${name.split(' ')[0]}`,code(),user.id]);
+      account=normalizeAccount(accountResult.rows[0]);
+      await client.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2)`,[account.id,user.id]);
+      await client.query('COMMIT'); client=null;
+    } else {
+      const now=new Date().toISOString();
+      user={id:memory.seq.users++,name,phoneDigits,createdAt:now}; memory.users.push(user);
+      account={id:memory.seq.accounts++,name:`Conta de ${name.split(' ')[0]}`,code:code()};
+      memory.accounts.push({...account,createdBy:user.id,createdAt:now});
+      memory.memberships.push({id:memory.seq.memberships++,accountId:account.id,userId:user.id,joinedAt:now});
+      await fileStoreSave();
+    }
+    const session=setSession(res,user.id);
+    console.log(`[signup] ok user=${user.id} account=${account.id} storage=${storageType()}`);
+    return res.status(201).json({ok:true,user,profile:user,account,session});
+  } catch(err){
+    if(client) await client.query('ROLLBACK').catch(()=>{});
+    console.error('[signup]',err);
+    const detail=isProd?undefined:err.stack;
+    return res.status(500).json({ok:false,error:'Não foi possível criar o perfil.',detail});
+  } finally { if(client) client.release(); }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const phoneDigits = digits4(req.body.phoneDigits);
-  if (!/^\d{4}$/.test(phoneDigits)) return res.status(400).json({ ok:false, error:'Informe os 4 últimos dígitos.' });
-  try {
-    await requireDatabase();
-    const r = await pool.query(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE phone_digits=$1 ORDER BY created_at DESC LIMIT 1`, [phoneDigits]);
-    const user = r.rows[0];
-    if (!user) return res.status(401).json({ ok:false, error:'Perfil não encontrado. Cadastre-se primeiro.' });
-    const account = await getAccount(user.id);
-    if (!account) return res.status(409).json({ ok:false, error:'Seu perfil não possui uma conta conjunta.' });
-    const session = setSession(res, user.id);
-    res.json({ ok:true, user, profile:user, account, session });
-  } catch (err) {
-    console.error('[login]', err);
-    res.status(503).json({ ok:false, error:'Banco de dados indisponível.' });
-  }
+app.post('/api/auth/login', async (req,res)=>{
+  const phoneDigits=digits4(req.body.phoneDigits); if(!/^\d{4}$/.test(phoneDigits)) return res.status(400).json({ok:false,error:'Informe os 4 últimos dígitos.'});
+  try{
+    await requireStorage(); let user;
+    if(pool){ const r=await pool.query(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE phone_digits=$1 ORDER BY created_at DESC LIMIT 1`,[phoneDigits]); user=normalizeUser(r.rows[0]); }
+    else { user=clone(memory.users.filter(u=>u.phoneDigits===phoneDigits).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))[0])||null; }
+    if(!user) return res.status(401).json({ok:false,error:'Perfil não encontrado. Cadastre-se primeiro.'});
+    const account=await getAccount(user.id); if(!account) return res.status(409).json({ok:false,error:'Seu perfil não possui uma conta conjunta.'});
+    const session=setSession(res,user.id); res.json({ok:true,user,profile:user,account,session});
+  }catch(err){console.error('[login]',err);res.status(503).json({ok:false,error:'Não foi possível entrar no sistema.',detail:isProd?undefined:err.message});}
+});
+app.post('/api/auth/logout',(req,res)=>{clearSession(res);res.json({ok:true});});
+
+app.get('/api/state',auth,async(req,res)=>{try{const account=await getAccount(req.user.id);if(!account)return res.status(404).json({ok:false,error:'Conta conjunta não encontrada.'});const [members,records,totals]=await Promise.all([getMembers(account.id),getRecords(account.id),getTotals(account.id,req.user.id)]);res.json({ok:true,user:req.user,account,members,records,totals:{dep:totals.dep,wit:totals.wit,balance:totals.balance},individualBalance:totals.individualBalance});}catch(err){console.error('[state]',err);res.status(500).json({ok:false,error:'Não foi possível carregar os dados.',detail:isProd?undefined:err.message});}});
+
+app.post('/api/accounts/join',auth,async(req,res)=>{
+  const accountCode=String(req.body.code||'').trim().toUpperCase(); if(!accountCode)return res.status(400).json({ok:false,error:'Informe o código da conta.'});
+  try{await requireStorage();let account;
+    if(pool){const ar=await pool.query(`SELECT id,name,code FROM accounts WHERE code=$1`,[accountCode]);account=normalizeAccount(ar.rows[0]);if(!account)return res.status(404).json({ok:false,error:'Conta não encontrada.'});await pool.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2) ON CONFLICT(account_id,user_id) DO NOTHING`,[account.id,req.user.id]);}
+    else {account=normalizeAccount(memory.accounts.find(a=>a.code===accountCode));if(!account)return res.status(404).json({ok:false,error:'Conta não encontrada.'});if(!memory.memberships.some(m=>Number(m.accountId)===account.id&&Number(m.userId)===req.user.id))memory.memberships.push({id:memory.seq.memberships++,accountId:account.id,userId:req.user.id,joinedAt:new Date().toISOString()});await fileStoreSave();}
+    broadcast(account.id,{type:'members_changed'});res.json({ok:true,account});
+  }catch(err){console.error('[join]',err);res.status(500).json({ok:false,error:'Não foi possível entrar na conta.',detail:isProd?undefined:err.message});}
 });
 
-app.post('/api/auth/logout', (req, res) => { clearSession(res); res.json({ ok:true }); });
-
-app.get('/api/state', auth, async (req, res) => {
-  try {
-    const account = await getAccount(req.user.id);
-    if (!account) return res.status(404).json({ ok:false, error:'Conta conjunta não encontrada.' });
-    const [members, records, totals] = await Promise.all([getMembers(account.id), getRecords(account.id), getTotals(account.id, req.user.id)]);
-    res.json({ ok:true, user:req.user, account, members, records, totals:{ dep:totals.dep, wit:totals.wit, balance:totals.balance }, individualBalance:totals.individualBalance });
-  } catch (err) { console.error('[state]', err); res.status(500).json({ ok:false, error:'Não foi possível carregar os dados.' }); }
+app.post('/api/records',auth,upload.single('receipt'),async(req,res)=>{
+  const type=req.body.type==='wit'?'wit':'dep', value=amount(req.body.amount); if(!(value>0))return res.status(400).json({ok:false,error:'Informe um valor válido.'});
+  try{await requireStorage();const account=await getAccount(req.user.id);if(!account)return res.status(404).json({ok:false,error:'Conta conjunta não encontrada.'});const bank=String(req.body.bank||'').trim(), description=String(req.body.description||'').trim(), createdAt=new Date().toISOString();let record;
+    if(pool){const r=await pool.query(`INSERT INTO records(account_id,user_id,type,amount,bank,description,receipt,receipt_name,receipt_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,type,amount::float AS amount,bank,description,created_at AS "createdAt",user_id AS "userId",(receipt IS NOT NULL) AS "hasReceipt"`,[account.id,req.user.id,type,value,bank,description,req.file?.buffer||null,req.file?.originalname||null,req.file?.mimetype||null]);record=normalizeRecord({...r.rows[0],userName:req.user.name});}
+    else {record={id:memory.seq.records++,accountId:account.id,userId:req.user.id,type,amount:value,bank,description,receipt:req.file?req.file.buffer.toString('base64'):null,receiptName:req.file?.originalname||null,receiptType:req.file?.mimetype||null,createdAt,userName:req.user.name,hasReceipt:Boolean(req.file)};memory.records.push(record);await fileStoreSave();record=normalizeRecord(record);}
+    broadcast(account.id,{type:'record_created',record});res.status(201).json({ok:true,record});
+  }catch(err){console.error('[record]',err);res.status(500).json({ok:false,error:'Não foi possível registrar a movimentação.',detail:isProd?undefined:err.message});}
 });
 
-app.post('/api/accounts/join', auth, async (req, res) => {
-  const accountCode = String(req.body.code || '').trim().toUpperCase();
-  if (!accountCode) return res.status(400).json({ ok:false, error:'Informe o código da conta.' });
-  try {
-    const accountResult = await pool.query(`SELECT id,name,code FROM accounts WHERE code=$1`, [accountCode]);
-    const account = accountResult.rows[0];
-    if (!account) return res.status(404).json({ ok:false, error:'Conta não encontrada.' });
-    await pool.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2) ON CONFLICT(account_id,user_id) DO NOTHING`, [account.id, req.user.id]);
-    broadcast(account.id, { type:'members_changed' });
-    res.json({ ok:true, account });
-  } catch (err) { console.error('[join]', err); res.status(500).json({ ok:false, error:'Não foi possível entrar na conta.' }); }
-});
+app.get('/api/records/:id/receipt',auth,async(req,res)=>{try{const account=await getAccount(req.user.id);if(!account)return res.sendStatus(404);if(pool){const r=await pool.query(`SELECT receipt,receipt_name,receipt_type FROM records WHERE id=$1 AND account_id=$2`,[req.params.id,account.id]);if(!r.rows[0]||!r.rows[0].receipt)return res.sendStatus(404);res.setHeader('Content-Type',r.rows[0].receipt_type||'application/octet-stream');res.setHeader('Content-Disposition',`inline; filename="${String(r.rows[0].receipt_name||'comprovante').replace(/"/g,'')}"`);return res.end(r.rows[0].receipt);}const r=memory.records.find(x=>Number(x.id)===Number(req.params.id)&&Number(x.accountId)===Number(account.id));if(!r||!r.receipt)return res.sendStatus(404);res.setHeader('Content-Type',r.receiptType||'application/octet-stream');res.setHeader('Content-Disposition',`inline; filename="${String(r.receiptName||'comprovante').replace(/"/g,'')}"`);res.end(Buffer.from(r.receipt,'base64'));}catch(err){console.error('[receipt]',err);res.sendStatus(500);}});
 
-app.post('/api/records', auth, upload.single('receipt'), async (req, res) => {
-  const type = req.body.type === 'wit' ? 'wit' : 'dep';
-  const value = amount(req.body.amount);
-  if (!Number.isFinite(value) || value <= 0) return res.status(400).json({ ok:false, error:'Informe um valor válido.' });
-  try {
-    const account = await getAccount(req.user.id);
-    if (!account) return res.status(404).json({ ok:false, error:'Conta conjunta não encontrada.' });
-    const r = await pool.query(`INSERT INTO records(account_id,user_id,type,amount,bank,description,receipt,receipt_name,receipt_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,type,amount::float AS amount,bank,description,created_at AS "createdAt",user_id AS "userId",(receipt IS NOT NULL) AS "hasReceipt"`, [account.id, req.user.id, type, value, String(req.body.bank || '').trim(), String(req.body.description || '').trim(), req.file?.buffer || null, req.file?.originalname || null, req.file?.mimetype || null]);
-    const record = { ...r.rows[0], userName:req.user.name };
-    broadcast(account.id, { type:'record_created', record });
-    res.status(201).json({ ok:true, record });
-  } catch (err) { console.error('[record]', err); res.status(500).json({ ok:false, error:'Não foi possível registrar a movimentação.' }); }
-});
+app.get('/styles.css',(_req,res)=>res.sendFile(path.join(__dirname,'styles.css')));
+app.get('/app.js',(_req,res)=>res.sendFile(path.join(__dirname,'app.js')));
+app.get('/manifest.webmanifest',(_req,res)=>res.sendFile(path.join(__dirname,'manifest.webmanifest')));
+app.get('/',(_req,res)=>res.sendFile(path.join(__dirname,'index.html')));
+app.use((req,res,next)=>{if(req.path.startsWith('/api/'))return res.status(404).json({ok:false,error:'Rota da API não encontrada.'});if(req.path==='/ws')return next();res.sendFile(path.join(__dirname,'index.html'));});
 
-app.get('/api/records/:id/receipt', auth, async (req, res) => {
-  try {
-    const account = await getAccount(req.user.id);
-    const r = await pool.query(`SELECT receipt,receipt_name,receipt_type FROM records WHERE id=$1 AND account_id=$2`, [req.params.id, account?.id]);
-    if (!r.rows[0] || !r.rows[0].receipt) return res.sendStatus(404);
-    res.setHeader('Content-Type', r.rows[0].receipt_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${String(r.rows[0].receipt_name || 'comprovante').replace(/"/g, '')}"`);
-    res.end(r.rows[0].receipt);
-  } catch (err) { console.error('[receipt]', err); res.sendStatus(500); }
-});
+app.use((err,_req,res,_next)=>{console.error('[http]',err);res.status(400).json({ok:false,error:err.message||'Erro inesperado.'});});
 
-app.get('/styles.css', (_req, res) => res.sendFile(path.join(__dirname, 'styles.css')));
-app.get('/app.js', (_req, res) => res.sendFile(path.join(__dirname, 'app.js')));
-app.get('/manifest.webmanifest', (_req, res) => res.sendFile(path.join(__dirname, 'manifest.webmanifest')));
-app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
-app.get(/^\/(?!api\/|styles\.css$|app\.js$|manifest\.webmanifest$).*/, (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+const sockets=new Map();
+function broadcast(accountId,payload){const set=sockets.get(String(accountId));if(!set)return;const message=JSON.stringify(payload);for(const ws of set)if(ws.readyState===1)ws.send(message);}
+const wss=new WebSocketServer({server,path:'/ws'});
+wss.on('connection',async(ws,req)=>{try{await requireStorage();const url=new URL(req.url,'http://localhost');const userId=verifyToken(url.searchParams.get('token'));if(!userId)return ws.close(1008,'unauthorized');const account=await getAccount(userId);if(!account)return ws.close(1008,'no-account');const key=String(account.id);if(!sockets.has(key))sockets.set(key,new Set());sockets.get(key).add(ws);ws.send(JSON.stringify({type:'connected',accountId:account.id}));ws.on('close',()=>{const set=sockets.get(key);if(!set)return;set.delete(ws);if(!set.size)sockets.delete(key);});}catch(err){console.error('[ws]',err);ws.close(1011,'server-error');}});
 
-app.use((err, _req, res, _next) => {
-  console.error('[http]', err);
-  res.status(400).json({ ok:false, error:err.message || 'Erro inesperado.' });
-});
-
-const sockets = new Map();
-function broadcast(accountId, payload) {
-  const set = sockets.get(String(accountId));
-  if (!set) return;
-  const message = JSON.stringify(payload);
-  for (const ws of set) if (ws.readyState === 1) ws.send(message);
-}
-
-const wss = new WebSocketServer({ server, path:'/ws' });
-wss.on('connection', async (ws, req) => {
-  try {
-    await requireDatabase();
-    const url = new URL(req.url, 'http://localhost');
-    const userId = verifyToken(url.searchParams.get('token'));
-    if (!userId) return ws.close(1008, 'unauthorized');
-    const account = await getAccount(userId);
-    if (!account) return ws.close(1008, 'no-account');
-    const key = String(account.id);
-    if (!sockets.has(key)) sockets.set(key, new Set());
-    sockets.get(key).add(ws);
-    ws.send(JSON.stringify({ type:'connected', accountId:account.id }));
-    ws.on('close', () => {
-      const set = sockets.get(key);
-      if (!set) return;
-      set.delete(ws);
-      if (!set.size) sockets.delete(key);
-    });
-  } catch { ws.close(1011, 'server-error'); }
-});
-
-server.listen(PORT, '0.0.0.0', () => console.log(`Poolvault listening on 0.0.0.0:${PORT}`));
+server.listen(PORT,'0.0.0.0',()=>{console.log(`Poolvault listening on 0.0.0.0:${PORT}`);console.log(`[storage] ${storageType()}`);});
