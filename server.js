@@ -1,341 +1,43 @@
 'use strict';
-
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const express = require('express');
-const multer = require('multer');
-const { Pool } = require('pg');
-const { WebSocketServer } = require('ws');
-
-const app = express();
-const server = http.createServer(app);
-const PORT = Number(process.env.PORT || 10000);
-const SESSION_SECRET = process.env.SESSION_SECRET || 'poolvault-development-secret-change-me';
-const isProd = process.env.NODE_ENV === 'production';
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const DATA_DIR = process.env.POOLVAULT_DATA_DIR || path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'poolvault.json');
-
-app.disable('x-powered-by');
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const allowed = /^(image\/(jpeg|png|webp|gif)|application\/pdf)$/i.test(file.mimetype);
-    cb(allowed ? null : new Error('Comprovante deve ser imagem ou PDF.'), allowed);
-  }
-});
-
-const pool = DATABASE_URL ? new Pool({
-  connectionString: DATABASE_URL,
-  ssl: isProd ? { rejectUnauthorized: false } : undefined,
-  max: 10,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000
-}) : null;
-if (pool) pool.on('error', err => console.error('[postgres]', err));
-
-const memory = {
-  users: [], accounts: [], memberships: [], records: [],
-  seq: { users: 1, accounts: 1, memberships: 1, records: 1 },
-  loaded: false
-};
-let fileSaveQueue = Promise.resolve();
-
-function fileStoreLoad() {
-  if (memory.loaded) return;
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (fs.existsSync(DATA_FILE)) {
-    try {
-      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      for (const key of ['users','accounts','memberships','records']) memory[key] = Array.isArray(raw[key]) ? raw[key] : [];
-      memory.seq = raw.seq || memory.seq;
-    } catch (err) {
-      console.error('[filedb] arquivo inválido, iniciando banco vazio:', err.message);
-    }
-  }
-  memory.loaded = true;
-}
-function fileStoreSave() {
-  fileSaveQueue = fileSaveQueue.then(async () => {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ ...memory, savedAt: new Date().toISOString() }, null, 2));
-    fs.renameSync(tmp, DATA_FILE);
-  }).catch(err => console.error('[filedb] save:', err));
-  return fileSaveQueue;
-}
-function clone(v) { return JSON.parse(JSON.stringify(v)); }
-
-let dbReady = null;
-async function initPg() {
-  if (!pool) return;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        phone_digits VARCHAR(4) NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS accounts (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        code VARCHAR(12) NOT NULL UNIQUE,
-        created_by BIGINT NOT NULL REFERENCES users(id),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS memberships (
-        id BIGSERIAL PRIMARY KEY,
-        account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(account_id, user_id)
-      );
-      CREATE TABLE IF NOT EXISTS records (
-        id BIGSERIAL PRIMARY KEY,
-        account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-        user_id BIGINT NOT NULL REFERENCES users(id),
-        type VARCHAR(3) NOT NULL CHECK(type IN ('dep','wit')),
-        amount NUMERIC(14,2) NOT NULL CHECK(amount > 0),
-        bank TEXT,
-        description TEXT,
-        receipt BYTEA,
-        receipt_name TEXT,
-        receipt_type TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);
-      CREATE INDEX IF NOT EXISTS idx_memberships_account ON memberships(account_id);
-      CREATE INDEX IF NOT EXISTS idx_records_account_created ON records(account_id, created_at DESC);
-    `);
-    await client.query('COMMIT');
-    console.log('[db] PostgreSQL schema ready');
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally { client.release(); }
-}
-async function ensureDb() {
-  if (!pool) return;
-  if (!dbReady) dbReady = initPg().catch(err => { dbReady = null; throw err; });
-  await dbReady;
-}
-
-function storageType() { return pool ? 'postgres' : 'file'; }
-async function requireStorage() {
-  if (pool) { await ensureDb(); return; }
-  fileStoreLoad();
-}
-
-function cleanName(value) { return String(value || '').trim().replace(/\s+/g, ' '); }
-function digits4(value) { return String(value || '').replace(/\D/g, '').slice(-4); }
-function amount(value) { const n = Number(value); return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN; }
-function code() { return crypto.randomBytes(5).toString('hex').toUpperCase(); }
-function tokenFor(userId) {
-  const payload = `${userId}.${Date.now()}`;
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
-  return Buffer.from(`${payload}.${sig}`).toString('base64url');
-}
-function verifyToken(token) {
-  try {
-    const raw = Buffer.from(String(token || ''), 'base64url').toString('utf8');
-    const [id, timestamp, signature] = raw.split('.');
-    if (!id || !timestamp || !signature) return null;
-    const expected = crypto.createHmac('sha256', SESSION_SECRET).update(`${id}.${timestamp}`).digest('hex');
-    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
-    if (!Number.isFinite(Number(timestamp)) || Date.now() - Number(timestamp) > 30 * 24 * 60 * 60 * 1000) return null;
-    return Number(id);
-  } catch { return null; }
-}
-function parseCookies(req) {
-  const out = {};
-  String(req.headers.cookie || '').split(';').forEach(part => {
-    const i = part.indexOf('='); if (i <= 0) return;
-    try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1)); } catch {}
-  });
-  return out;
-}
-function setSession(res, userId) {
-  const token = tokenFor(userId);
-  const flags = `Path=/; Max-Age=${30 * 24 * 60 * 60}; HttpOnly; SameSite=Lax${isProd ? '; Secure' : ''}`;
-  res.setHeader('Set-Cookie', `pv_session=${encodeURIComponent(token)}; ${flags}`);
-  return token;
-}
-function clearSession(res) { res.setHeader('Set-Cookie', `pv_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${isProd ? '; Secure' : ''}`); }
-function requestUserId(req) { const c = parseCookies(req); return verifyToken(c.pv_session || req.headers['x-poolvault-session'] || ''); }
-
-function normalizeUser(u) { return u ? { id:Number(u.id), name:u.name, phoneDigits:u.phoneDigits ?? u.phone_digits, createdAt:u.createdAt ?? u.created_at } : null; }
-function normalizeAccount(a) { return a ? { id:Number(a.id), name:a.name, code:a.code } : null; }
-function normalizeRecord(r) { return r ? { id:Number(r.id), type:r.type, amount:Number(r.amount), bank:r.bank || '', description:r.description || '', createdAt:r.createdAt ?? r.created_at, userId:Number(r.userId ?? r.user_id), userName:r.userName ?? r.user_name, hasReceipt:Boolean(r.hasReceipt ?? r.has_receipt) } : null; }
-
-async function getUser(id) {
-  await requireStorage();
-  if (pool) {
-    const r = await pool.query(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE id=$1`, [id]);
-    return normalizeUser(r.rows[0]);
-  }
-  return normalizeUser(memory.users.find(u => Number(u.id) === Number(id)));
-}
-async function getAccount(userId) {
-  await requireStorage();
-  if (pool) {
-    const r = await pool.query(`SELECT a.id,a.name,a.code FROM accounts a JOIN memberships m ON m.account_id=a.id WHERE m.user_id=$1 ORDER BY a.id LIMIT 1`, [userId]);
-    return normalizeAccount(r.rows[0]);
-  }
-  const mem = memory.memberships.filter(m => Number(m.userId) === Number(userId)).sort((a,b) => Number(a.accountId)-Number(b.accountId))[0];
-  return mem ? normalizeAccount(memory.accounts.find(a => Number(a.id) === Number(mem.accountId))) : null;
-}
-async function getMembers(accountId) {
-  await requireStorage();
-  if (pool) {
-    const r = await pool.query(`SELECT u.id,u.name,u.phone_digits AS "phoneDigits",u.created_at AS "createdAt",m.joined_at AS "joinedAt",m.id AS "membershipId",m.user_id AS "userId" FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.account_id=$1 ORDER BY u.name`, [accountId]);
-    return r.rows.map(x => ({...x, id:Number(x.id), userId:Number(x.userId), membershipId:Number(x.membershipId)}));
-  }
-  return memory.memberships.filter(m => Number(m.accountId) === Number(accountId)).map(m => {
-    const u = memory.users.find(x => Number(x.id) === Number(m.userId));
-    return { id:Number(u.id), userId:Number(u.id), name:u.name, phoneDigits:u.phoneDigits, createdAt:u.createdAt, joinedAt:m.joinedAt, membershipId:Number(m.id) };
-  }).sort((a,b)=>a.name.localeCompare(b.name));
-}
-async function getRecords(accountId) {
-  await requireStorage();
-  if (pool) {
-    const r = await pool.query(`SELECT r.id,r.type,r.amount::float AS amount,r.bank,r.description,r.created_at AS "createdAt",r.user_id AS "userId",u.name AS "userName",(r.receipt IS NOT NULL) AS "hasReceipt" FROM records r JOIN users u ON u.id=r.user_id WHERE r.account_id=$1 ORDER BY r.created_at DESC LIMIT 200`, [accountId]);
-    return r.rows.map(normalizeRecord);
-  }
-  return memory.records.filter(r => Number(r.accountId) === Number(accountId)).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,200).map(normalizeRecord);
-}
-async function getTotals(accountId, userId) {
-  await requireStorage();
-  if (pool) {
-    const [total, personal] = await Promise.all([
-      pool.query(`SELECT COALESCE(SUM(CASE WHEN type='dep' THEN amount ELSE 0 END),0)::float AS dep, COALESCE(SUM(CASE WHEN type='wit' THEN amount ELSE 0 END),0)::float AS wit FROM records WHERE account_id=$1`, [accountId]),
-      pool.query(`SELECT COALESCE(SUM(CASE WHEN type='dep' THEN amount ELSE -amount END),0)::float AS balance FROM records WHERE account_id=$1 AND user_id=$2`, [accountId, userId])
-    ]);
-    const dep=Number(total.rows[0].dep||0), wit=Number(total.rows[0].wit||0);
-    return { dep,wit,balance:dep-wit,individualBalance:Number(personal.rows[0].balance||0) };
-  }
-  const recs = memory.records.filter(r => Number(r.accountId) === Number(accountId));
-  const dep = recs.filter(r=>r.type==='dep').reduce((s,r)=>s+Number(r.amount),0);
-  const wit = recs.filter(r=>r.type==='wit').reduce((s,r)=>s+Number(r.amount),0);
-  const personal = recs.filter(r=>Number(r.userId)===Number(userId)).reduce((s,r)=>s+(r.type==='dep'?1:-1)*Number(r.amount),0);
-  return { dep,wit,balance:dep-wit,individualBalance:personal };
-}
-
-async function auth(req,res,next){
-  try {
-    await requireStorage();
-    const userId=requestUserId(req); if(!userId) return res.status(401).json({ok:false,error:'Sessão não encontrada. Faça login novamente.'});
-    const user=await getUser(userId); if(!user) return res.status(401).json({ok:false,error:'Perfil não encontrado.'});
-    req.user=user; next();
-  } catch(err){ console.error('[auth]',err); res.status(503).json({ok:false,error:'Banco de dados indisponível. Verifique a configuração de armazenamento.',detail: isProd ? undefined : err.message}); }
-}
-
-app.get('/api/health', async (_req,res)=>{
-  try {
-    await requireStorage();
-    if (pool) { await pool.query('SELECT 1'); return res.json({ok:true,db:'postgres',persistent:true}); }
-    return res.json({ok:true,db:'file',persistent:true,note:'Configure DATABASE_URL no Render para usar PostgreSQL.'});
-  } catch(err){ console.error('[health]',err); res.status(503).json({ok:false,db:storageType(),persistent:false,error:isProd?'Storage indisponível.':err.message}); }
-});
-
-app.get('/api/session', async (req,res)=>{
-  try {
-    await requireStorage(); const userId=requestUserId(req); if(!userId) return res.json({ok:true,authenticated:false});
-    const user=await getUser(userId), account=user?await getAccount(user.id):null;
-    if(!user||!account) return res.json({ok:true,authenticated:false});
-    res.json({ok:true,authenticated:true,user,profile:user,account});
-  } catch(err){ console.error('[session]',err); res.status(503).json({ok:false,error:'Não foi possível verificar a sessão.',detail:isProd?undefined:err.message}); }
-});
-
-app.post('/api/auth/signup', async (req,res)=>{
-  const name=cleanName(req.body.name), phoneDigits=digits4(req.body.phoneDigits);
-  if(name.split(/\s+/).length<2) return res.status(400).json({ok:false,error:'Informe nome e sobrenome.'});
-  if(!/^\d{4}$/.test(phoneDigits)) return res.status(400).json({ok:false,error:'Informe os 4 últimos dígitos do celular.'});
-  let client;
-  try {
-    await requireStorage();
-    let user, account;
-    if(pool){
-      client=await pool.connect(); await client.query('BEGIN');
-      const userResult=await client.query(`INSERT INTO users(name,phone_digits) VALUES($1,$2) RETURNING id,name,phone_digits AS "phoneDigits",created_at AS "createdAt"`,[name,phoneDigits]);
-      user=normalizeUser(userResult.rows[0]);
-      const accountResult=await client.query(`INSERT INTO accounts(name,code,created_by) VALUES($1,$2,$3) RETURNING id,name,code`,[`Conta de ${name.split(' ')[0]}`,code(),user.id]);
-      account=normalizeAccount(accountResult.rows[0]);
-      await client.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2)`,[account.id,user.id]);
-      await client.query('COMMIT'); client=null;
-    } else {
-      const now=new Date().toISOString();
-      user={id:memory.seq.users++,name,phoneDigits,createdAt:now}; memory.users.push(user);
-      account={id:memory.seq.accounts++,name:`Conta de ${name.split(' ')[0]}`,code:code()};
-      memory.accounts.push({...account,createdBy:user.id,createdAt:now});
-      memory.memberships.push({id:memory.seq.memberships++,accountId:account.id,userId:user.id,joinedAt:now});
-      await fileStoreSave();
-    }
-    const session=setSession(res,user.id);
-    console.log(`[signup] ok user=${user.id} account=${account.id} storage=${storageType()}`);
-    return res.status(201).json({ok:true,user,profile:user,account,session});
-  } catch(err){
-    if(client) await client.query('ROLLBACK').catch(()=>{});
-    console.error('[signup]',err);
-    const detail=isProd?undefined:err.stack;
-    return res.status(500).json({ok:false,error:'Não foi possível criar o perfil.',detail});
-  } finally { if(client) client.release(); }
-});
-
-app.post('/api/auth/login', async (req,res)=>{
-  const phoneDigits=digits4(req.body.phoneDigits); if(!/^\d{4}$/.test(phoneDigits)) return res.status(400).json({ok:false,error:'Informe os 4 últimos dígitos.'});
-  try{
-    await requireStorage(); let user;
-    if(pool){ const r=await pool.query(`SELECT id,name,phone_digits AS "phoneDigits",created_at AS "createdAt" FROM users WHERE phone_digits=$1 ORDER BY created_at DESC LIMIT 1`,[phoneDigits]); user=normalizeUser(r.rows[0]); }
-    else { user=clone(memory.users.filter(u=>u.phoneDigits===phoneDigits).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))[0])||null; }
-    if(!user) return res.status(401).json({ok:false,error:'Perfil não encontrado. Cadastre-se primeiro.'});
-    const account=await getAccount(user.id); if(!account) return res.status(409).json({ok:false,error:'Seu perfil não possui uma conta conjunta.'});
-    const session=setSession(res,user.id); res.json({ok:true,user,profile:user,account,session});
-  }catch(err){console.error('[login]',err);res.status(503).json({ok:false,error:'Não foi possível entrar no sistema.',detail:isProd?undefined:err.message});}
-});
-app.post('/api/auth/logout',(req,res)=>{clearSession(res);res.json({ok:true});});
-
-app.get('/api/state',auth,async(req,res)=>{try{const account=await getAccount(req.user.id);if(!account)return res.status(404).json({ok:false,error:'Conta conjunta não encontrada.'});const [members,records,totals]=await Promise.all([getMembers(account.id),getRecords(account.id),getTotals(account.id,req.user.id)]);res.json({ok:true,user:req.user,account,members,records,totals:{dep:totals.dep,wit:totals.wit,balance:totals.balance},individualBalance:totals.individualBalance});}catch(err){console.error('[state]',err);res.status(500).json({ok:false,error:'Não foi possível carregar os dados.',detail:isProd?undefined:err.message});}});
-
-app.post('/api/accounts/join',auth,async(req,res)=>{
-  const accountCode=String(req.body.code||'').trim().toUpperCase(); if(!accountCode)return res.status(400).json({ok:false,error:'Informe o código da conta.'});
-  try{await requireStorage();let account;
-    if(pool){const ar=await pool.query(`SELECT id,name,code FROM accounts WHERE code=$1`,[accountCode]);account=normalizeAccount(ar.rows[0]);if(!account)return res.status(404).json({ok:false,error:'Conta não encontrada.'});await pool.query(`INSERT INTO memberships(account_id,user_id) VALUES($1,$2) ON CONFLICT(account_id,user_id) DO NOTHING`,[account.id,req.user.id]);}
-    else {account=normalizeAccount(memory.accounts.find(a=>a.code===accountCode));if(!account)return res.status(404).json({ok:false,error:'Conta não encontrada.'});if(!memory.memberships.some(m=>Number(m.accountId)===account.id&&Number(m.userId)===req.user.id))memory.memberships.push({id:memory.seq.memberships++,accountId:account.id,userId:req.user.id,joinedAt:new Date().toISOString()});await fileStoreSave();}
-    broadcast(account.id,{type:'members_changed'});res.json({ok:true,account});
-  }catch(err){console.error('[join]',err);res.status(500).json({ok:false,error:'Não foi possível entrar na conta.',detail:isProd?undefined:err.message});}
-});
-
-app.post('/api/records',auth,upload.single('receipt'),async(req,res)=>{
-  const type=req.body.type==='wit'?'wit':'dep', value=amount(req.body.amount); if(!(value>0))return res.status(400).json({ok:false,error:'Informe um valor válido.'});
-  try{await requireStorage();const account=await getAccount(req.user.id);if(!account)return res.status(404).json({ok:false,error:'Conta conjunta não encontrada.'});const bank=String(req.body.bank||'').trim(), description=String(req.body.description||'').trim(), createdAt=new Date().toISOString();let record;
-    if(pool){const r=await pool.query(`INSERT INTO records(account_id,user_id,type,amount,bank,description,receipt,receipt_name,receipt_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,type,amount::float AS amount,bank,description,created_at AS "createdAt",user_id AS "userId",(receipt IS NOT NULL) AS "hasReceipt"`,[account.id,req.user.id,type,value,bank,description,req.file?.buffer||null,req.file?.originalname||null,req.file?.mimetype||null]);record=normalizeRecord({...r.rows[0],userName:req.user.name});}
-    else {record={id:memory.seq.records++,accountId:account.id,userId:req.user.id,type,amount:value,bank,description,receipt:req.file?req.file.buffer.toString('base64'):null,receiptName:req.file?.originalname||null,receiptType:req.file?.mimetype||null,createdAt,userName:req.user.name,hasReceipt:Boolean(req.file)};memory.records.push(record);await fileStoreSave();record=normalizeRecord(record);}
-    broadcast(account.id,{type:'record_created',record});res.status(201).json({ok:true,record});
-  }catch(err){console.error('[record]',err);res.status(500).json({ok:false,error:'Não foi possível registrar a movimentação.',detail:isProd?undefined:err.message});}
-});
-
-app.get('/api/records/:id/receipt',auth,async(req,res)=>{try{const account=await getAccount(req.user.id);if(!account)return res.sendStatus(404);if(pool){const r=await pool.query(`SELECT receipt,receipt_name,receipt_type FROM records WHERE id=$1 AND account_id=$2`,[req.params.id,account.id]);if(!r.rows[0]||!r.rows[0].receipt)return res.sendStatus(404);res.setHeader('Content-Type',r.rows[0].receipt_type||'application/octet-stream');res.setHeader('Content-Disposition',`inline; filename="${String(r.rows[0].receipt_name||'comprovante').replace(/"/g,'')}"`);return res.end(r.rows[0].receipt);}const r=memory.records.find(x=>Number(x.id)===Number(req.params.id)&&Number(x.accountId)===Number(account.id));if(!r||!r.receipt)return res.sendStatus(404);res.setHeader('Content-Type',r.receiptType||'application/octet-stream');res.setHeader('Content-Disposition',`inline; filename="${String(r.receiptName||'comprovante').replace(/"/g,'')}"`);res.end(Buffer.from(r.receipt,'base64'));}catch(err){console.error('[receipt]',err);res.sendStatus(500);}});
-
-app.get('/styles.css',(_req,res)=>res.sendFile(path.join(__dirname,'styles.css')));
-app.get('/app.js',(_req,res)=>res.sendFile(path.join(__dirname,'app.js')));
-app.get('/manifest.webmanifest',(_req,res)=>res.sendFile(path.join(__dirname,'manifest.webmanifest')));
-app.get('/',(_req,res)=>res.sendFile(path.join(__dirname,'index.html')));
-app.use((req,res,next)=>{if(req.path.startsWith('/api/'))return res.status(404).json({ok:false,error:'Rota da API não encontrada.'});if(req.path==='/ws')return next();res.sendFile(path.join(__dirname,'index.html'));});
-
-app.use((err,_req,res,_next)=>{console.error('[http]',err);res.status(400).json({ok:false,error:err.message||'Erro inesperado.'});});
-
-const sockets=new Map();
-function broadcast(accountId,payload){const set=sockets.get(String(accountId));if(!set)return;const message=JSON.stringify(payload);for(const ws of set)if(ws.readyState===1)ws.send(message);}
-const wss=new WebSocketServer({server,path:'/ws'});
-wss.on('connection',async(ws,req)=>{try{await requireStorage();const url=new URL(req.url,'http://localhost');const userId=verifyToken(url.searchParams.get('token'));if(!userId)return ws.close(1008,'unauthorized');const account=await getAccount(userId);if(!account)return ws.close(1008,'no-account');const key=String(account.id);if(!sockets.has(key))sockets.set(key,new Set());sockets.get(key).add(ws);ws.send(JSON.stringify({type:'connected',accountId:account.id}));ws.on('close',()=>{const set=sockets.get(key);if(!set)return;set.delete(ws);if(!set.size)sockets.delete(key);});}catch(err){console.error('[ws]',err);ws.close(1011,'server-error');}});
-
-server.listen(PORT,'0.0.0.0',()=>{console.log(`Poolvault listening on 0.0.0.0:${PORT}`);console.log(`[storage] ${storageType()}`);});
+const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
+const PORT=Number(process.env.PORT||10000), ROOT=__dirname, DATA_DIR=process.env.POOLVAULT_DATA_DIR||path.join(ROOT,'data'), FILE=path.join(DATA_DIR,'poolvault.json');
+const SECRET=process.env.SESSION_SECRET||'poolvault-dev-secret';
+const db={users:[],accounts:[],memberships:[],records:[],seq:{users:1,accounts:1,memberships:1,records:1}};
+let saving=Promise.resolve(); fs.mkdirSync(DATA_DIR,{recursive:true});
+try{if(fs.existsSync(FILE))Object.assign(db,JSON.parse(fs.readFileSync(FILE,'utf8')));}catch(e){console.error(e.message)}
+const save=()=>{saving=saving.then(()=>{const t=FILE+'.tmp';fs.writeFileSync(t,JSON.stringify(db));fs.renameSync(t,FILE)});return saving};
+const json=(res,status,o,extra={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...extra});res.end(JSON.stringify(o))};
+const body=req=>new Promise((ok,no)=>{let a=[];let n=0;req.on('data',c=>{n+=c.length;if(n>8e6){no(Error('Payload muito grande'));req.destroy()}else a.push(c)});req.on('end',()=>{try{ok(JSON.parse(Buffer.concat(a).toString()||'{}'))}catch(e){no(Error('JSON inválido'))}});req.on('error',no)});
+const clean=v=>String(v||'').trim().replace(/\s+/g,' '), d4=v=>String(v||'').replace(/\D/g,'').slice(-4), code=()=>crypto.randomBytes(5).toString('hex').toUpperCase();
+function token(uid){const p=uid+'.'+Date.now();const s=crypto.createHmac('sha256',SECRET).update(p).digest('hex');return Buffer.from(p+'.'+s).toString('base64url')}
+function uid(req){const h=String(req.headers['x-poolvault-session']||'');try{const x=Buffer.from(h,'base64url').toString(),p=x.split('.');if(p.length!==3)return null;const ex=crypto.createHmac('sha256',SECRET).update(p[0]+'.'+p[1]).digest('hex');return ex===p[2]?Number(p[0]):null}catch{return null}}
+const user=id=>db.users.find(u=>Number(u.id)===Number(id))||null;
+const account=id=>{const m=db.memberships.find(x=>Number(x.userId)===Number(id));return m?db.accounts.find(a=>Number(a.id)===Number(m.accountId))||null:null};
+function payload(id){const u=user(id),a=account(id);return {ok:true,version:'11.0.0',user:u&&{id:Number(u.id),name:u.name,phoneDigits:u.phoneDigits,createdAt:u.createdAt},profile:u&&{id:Number(u.id),name:u.name,phoneDigits:u.phoneDigits,createdAt:u.createdAt},account:a&&{id:Number(a.id),name:a.name,code:a.code}}}
+async function api(req,res){const u=new URL(req.url,'http://localhost'),p=u.pathname;res.setHeader('X-Poolvault-Version','11.0.0');
+try{
+ if(req.method==='GET'&&p==='/api/health')return json(res,200,{ok:true,server:true,version:'11.0.0',storage:'json-file',users:db.users.length,accounts:db.accounts.length});
+ if(req.method==='GET'&&p==='/api/session'){const id=uid(req);if(!id||!user(id)||!account(id))return json(res,200,{ok:true,authenticated:false,version:'11.0.0'});return json(res,200,{...payload(id),authenticated:true,session:null});}
+ if(req.method==='POST'&&p==='/api/auth/signup'){
+   const b=await body(req),name=clean(b.name),ph=d4(b.phoneDigits);if(name.split(' ').length<2)return json(res,400,{ok:false,error:'Informe nome e sobrenome.'});if(!/^\d{4}$/.test(ph))return json(res,400,{ok:false,error:'Informe os 4 últimos dígitos do celular.'});
+   const now=new Date().toISOString(),u={id:db.seq.users++,name,phoneDigits:ph,createdAt:now},a={id:db.seq.accounts++,name:'Conta de '+name.split(' ')[0],code:code(),createdBy:u.id,createdAt:now};
+   db.users.push(u);db.accounts.push(a);db.memberships.push({id:db.seq.memberships++,accountId:a.id,userId:u.id,joinedAt:now});await save();const s=token(u.id);res.setHeader('X-Poolvault-Session',s);return json(res,201,{...payload(u.id),session:s});
+ }
+ if(req.method==='POST'&&p==='/api/auth/login'){
+   const b=await body(req),ph=d4(b.phoneDigits),x=[...db.users].reverse().find(x=>x.phoneDigits===ph);if(!x)return json(res,401,{ok:false,error:'Perfil não encontrado. Cadastre-se primeiro.'});const a=account(x.id);if(!a)return json(res,409,{ok:false,error:'Seu perfil não possui uma conta conjunta.'});const s=token(x.id);return json(res,200,{...payload(x.id),session:s});
+ }
+ if(req.method==='POST'&&p==='/api/auth/logout')return json(res,200,{ok:true});
+ const id=uid(req);if(!id||!user(id))return json(res,401,{ok:false,error:'Sessão não encontrada. Faça login novamente.'});
+ if(req.method==='GET'&&p==='/api/state'){
+   const a=account(id),ms=db.memberships.filter(m=>Number(m.accountId)===Number(a.id)).map(m=>{const x=user(m.userId);return {id:x.id,userId:x.id,name:x.name,phoneDigits:x.phoneDigits,createdAt:x.createdAt,membershipId:m.id,joinedAt:m.joinedAt}}),rs=db.records.filter(r=>Number(r.accountId)===Number(a.id)).sort((x,y)=>new Date(y.createdAt)-new Date(x.createdAt)).slice(0,200).map(r=>({id:r.id,type:r.type,amount:Number(r.amount),bank:r.bank||'',description:r.description||'',createdAt:r.createdAt,userId:r.userId,userName:user(r.userId)?.name||'Usuário',hasReceipt:Boolean(r.receipt)}));
+   const dep=rs.filter(r=>r.type==='dep').reduce((s,r)=>s+r.amount,0),wit=rs.filter(r=>r.type==='wit').reduce((s,r)=>s+r.amount,0),ind=rs.filter(r=>r.userId===id).reduce((s,r)=>s+(r.type==='dep'?r.amount:-r.amount),0);return json(res,200,{ok:true,user:user(id),account:a,members:ms,records:rs,totals:{dep,wit,balance:dep-wit},individualBalance:ind,version:'11.0.0'});
+ }
+ if(req.method==='POST'&&p==='/api/accounts/join'){const b=await body(req),a=db.accounts.find(x=>x.code===String(b.code||'').trim().toUpperCase());if(!a)return json(res,404,{ok:false,error:'Conta não encontrada.'});if(!db.memberships.some(m=>m.accountId===a.id&&m.userId===id))db.memberships.push({id:db.seq.memberships++,accountId:a.id,userId:id,joinedAt:new Date().toISOString()});await save();return json(res,200,{ok:true,account:a});}
+ if(req.method==='POST'&&p==='/api/records'){
+   const b=await body(req),a=account(id),v=Math.round(Number(b.amount)*100)/100;if(!(v>0))return json(res,400,{ok:false,error:'Informe um valor válido.'});const r={id:db.seq.records++,accountId:a.id,userId:id,type:b.type==='wit'?'wit':'dep',amount:v,bank:clean(b.bank),description:clean(b.description),receipt:b.receipt?.data||null,receiptName:b.receipt?.name||null,receiptType:b.receipt?.type||null,createdAt:new Date().toISOString()};db.records.push(r);await save();return json(res,201,{ok:true,record:{id:r.id,type:r.type,amount:r.amount,bank:r.bank,description:r.description,createdAt:r.createdAt,userId:id,userName:user(id).name,hasReceipt:Boolean(r.receipt)}});
+ }
+ const m=p.match(/^\/api\/records\/(\d+)\/receipt$/);if(req.method==='GET'&&m){const a=account(id),r=db.records.find(x=>Number(x.id)===Number(m[1])&&Number(x.accountId)===Number(a.id));if(!r||!r.receipt)return res.writeHead(404).end();let b=r.receipt,t=r.receiptType||'application/octet-stream';if(b.startsWith('data:')){const z=b.match(/^data:([^;]+);base64,(.*)$/s);if(z){t=z[1];b=Buffer.from(z[2],'base64')}}else b=Buffer.from(b,'base64');res.writeHead(200,{'Content-Type':t,'Content-Disposition':'inline; filename="'+String(r.receiptName||'comprovante').replace(/"/g,'')+'"'});return res.end(b)}
+ return json(res,404,{ok:false,error:'Rota da API não encontrada.'});
+}catch(e){console.error('[api]',e);return json(res,500,{ok:false,error:e.message||'Erro interno',version:'11.0.0'})}}
+function staticFile(req,res){let p=new URL(req.url,'http://localhost').pathname;if(p==='/')p='/index.html';const f=path.join(ROOT,path.normalize(p));if(!f.startsWith(ROOT)||!fs.existsSync(f)||!fs.statSync(f).isFile())return json(res,404,{ok:false,error:'Arquivo não encontrado'});const ext=path.extname(f),mime={'.html':'text/html; charset=utf-8','.js':'application/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.webmanifest':'application/manifest+json'}[ext]||'application/octet-stream';res.writeHead(200,{'Content-Type':mime,'Cache-Control':'no-store'});fs.createReadStream(f).pipe(res)}
+http.createServer((req,res)=>req.url.startsWith('/api/')?api(req,res):req.method==='GET'?staticFile(req,res):json(res,405,{ok:false,error:'Método não permitido'})).listen(PORT,'0.0.0.0',()=>console.log(`Poolvault 11.0.0 ativo na porta ${PORT}`));

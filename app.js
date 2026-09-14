@@ -16,6 +16,7 @@
   let sessionToken = localStorage.getItem('poolvault_session') || '';
   let socket = null;
   let reconnectTimer = null;
+  let syncTimer = null;
 
   const money = (v) => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
   const shortName = (n) => String(n || '').trim().split(/\s+/)[0] || 'usuário';
@@ -39,7 +40,7 @@
   function api(url, options = {}) {
     const headers = new Headers(options.headers || {});
     if (sessionToken) headers.set('X-Poolvault-Session', sessionToken);
-    return fetch(url, { ...options, headers, credentials: 'same-origin' }).then(async (response) => {
+    return fetch(url, { ...options, headers, credentials: 'same-origin', cache: 'no-store' }).then(async (response) => {
       const text = await response.text();
       let data = {};
       try { data = text ? JSON.parse(text) : {}; } catch { throw new Error('Resposta inválida do servidor.'); }
@@ -86,7 +87,8 @@
       });
 
       const createdUser = data.user || data.profile;
-      if (!data.ok || !createdUser || !data.account) {
+      console.log('[cadastro][resposta]', data);
+      if (!data.ok || !createdUser || !data.account || !data.session) {
         const missing = [!createdUser && 'perfil', !data.account && 'conta', !data.session && 'sessão'].filter(Boolean).join(', ');
         throw new Error(data.error || `Cadastro incompleto no servidor${missing ? `: ${missing}` : ''}.`);
       }
@@ -152,11 +154,21 @@
     $('#profile-btn').textContent = initial(state.user.name);
     renderAll();
     goTab('home');
+    startPolling();
   }
 
   function getMyMember() {
     return state.members.find(m => Number(m.userId) === Number(state.user.id)) || null;
   }
+
+  async function pollState() {
+    if (!state.user || !state.account || document.visibilityState === 'hidden') return;
+    try {
+      const data = await api('/api/state');
+      state.user=data.user; state.account=data.account; state.members=Array.isArray(data.members)?data.members:[]; state.records=Array.isArray(data.records)?data.records:[]; state.totals=data.totals||state.totals; state.individualBalance=Number(data.individualBalance||0); renderAll();
+    } catch (e) { console.warn('[sync]', e.message); }
+  }
+  function startPolling() { clearInterval(syncTimer); pollState(); syncTimer=setInterval(pollState,4000); }
 
   function recordHTML(r) {
     const owner = state.members.find(m => Number(m.userId) === Number(r.userId)) || { initial: initial(r.userName), short: shortName(r.userName) };
@@ -205,14 +217,17 @@
     if (!(amount > 0)) return toast('Informe um valor válido.');
     const file = $('#record-proof').files[0];
     if (file && file.size > 5 * 1024 * 1024) return toast('Comprovante limitado a 5 MB.');
-    const fd = new FormData();
-    fd.append('type', mode);
-    fd.append('amount', amount.toFixed(2));
-    fd.append('bank', $('#record-bank').value);
-    fd.append('description', $('#record-desc').value.trim());
-    if (file) fd.append('receipt', file);
+    let receipt = null;
+    if (file) {
+      receipt = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve({ name:file.name, type:file.type || 'application/octet-stream', data:String(reader.result) });
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
     try {
-      await api('/api/records', { method: 'POST', body: fd });
+      await api('/api/records', { method: 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ type:mode, amount:amount.toFixed(2), bank:$('#record-bank').value, description:$('#record-desc').value.trim(), receipt }) });
       e.target.reset();
       await loadState();
       goTab('home');
@@ -268,22 +283,7 @@
     showView('view-login');
   }
 
-  function connectWS() {
-    if (!sessionToken || !state.account) return;
-    if (socket && socket.readyState < 2) socket.close();
-    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-    socket = new WebSocket(`${protocol}://${location.host}/ws?token=${encodeURIComponent(sessionToken)}`);
-    socket.onmessage = async event => {
-      try {
-        const message = JSON.parse(event.data);
-        if (message.type === 'record_created' || message.type === 'members_changed') await loadState();
-      } catch (err) { console.error('[ws]', err); }
-    };
-    socket.onclose = () => {
-      clearTimeout(reconnectTimer);
-      if (state.user) reconnectTimer = setTimeout(connectWS, 3000);
-    };
-  }
+  function connectWS() { startPolling(); }
 
   function wire() {
     setupDigits();
